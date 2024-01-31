@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config IT6807_HDMI_VBYONE
+tristate "IT6807 Driver Support(ITE)"
+default n
+help
+This is external hdmi switch vbyone chip driver.
+
+config IT6807_HDMI_VBYONE_DEBUG
+	bool "debugfs support for it6807"
+	depends on IT6807_HDMI_VBYONE
+	default y
+	help
+	  This enable debugfs support for it6807 driver. You can
+	  get debug info or debug the driver via debugfs interface.
