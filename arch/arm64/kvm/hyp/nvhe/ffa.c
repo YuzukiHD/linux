@@ -34,6 +34,7 @@
 #include <nvhe/mem_protect.h>
 #include <nvhe/memory.h>
 #include <nvhe/trap_handler.h>
+#include <nvhe/spinlock.h>
 
 /*
  * "ID value 0 must be returned at the Non-secure physical FF-A instance"
@@ -53,12 +54,19 @@ struct kvm_ffa_descriptor_buffer {
 
 static struct kvm_ffa_descriptor_buffer ffa_desc_buf;
 
+struct kvm_ffa_buffers {
+	hyp_spinlock_t lock;
+	void *tx;
+	void *rx;
+};
+
 /*
  * Note that we don't currently lock these buffers explicitly, instead
  * relying on the locking of the host FFA buffers as we only have one
  * client.
  */
-static struct kvm_ffa_buffers ffa_buffers;
+static struct kvm_ffa_buffers hyp_buffers;
+static struct kvm_ffa_buffers host_buffers;
 
 static void ffa_to_smccc_error(struct arm_smccc_res *res, u64 ffa_errno)
 {
@@ -100,13 +108,13 @@ static bool is_ffa_call(u64 func_id)
 	       ARM_SMCCC_FUNC_NUM(func_id) <= FFA_MAX_FUNC_NUM;
 }
 
-static int spmd_map_ffa_buffers(u64 ffa_page_count)
+static int ffa_map_hyp_buffers(u64 ffa_page_count)
 {
 	struct arm_smccc_res res;
 
 	arm_smccc_1_1_smc(FFA_FN64_RXTX_MAP,
-			  hyp_virt_to_phys(ffa_buffers.tx),
-			  hyp_virt_to_phys(ffa_buffers.rx),
+			  hyp_virt_to_phys(hyp_buffers.tx),
+			  hyp_virt_to_phys(hyp_buffers.rx),
 			  ffa_page_count,
 			  0, 0, 0, 0,
 			  &res);
@@ -114,7 +122,7 @@ static int spmd_map_ffa_buffers(u64 ffa_page_count)
 	return res.a0 == FFA_SUCCESS ? FFA_RET_SUCCESS : res.a2;
 }
 
-static int spmd_unmap_ffa_buffers(void)
+static int ffa_unmap_hyp_buffers(void)
 {
 	struct arm_smccc_res res;
 
@@ -126,7 +134,7 @@ static int spmd_unmap_ffa_buffers(void)
 	return res.a0 == FFA_SUCCESS ? FFA_RET_SUCCESS : res.a2;
 }
 
-static void spmd_mem_frag_tx(struct arm_smccc_res *res, u32 handle_lo,
+static void ffa_mem_frag_tx(struct arm_smccc_res *res, u32 handle_lo,
 			     u32 handle_hi, u32 fraglen, u32 endpoint_id)
 {
 	arm_smccc_1_1_smc(FFA_MEM_FRAG_TX,
@@ -135,7 +143,7 @@ static void spmd_mem_frag_tx(struct arm_smccc_res *res, u32 handle_lo,
 			  res);
 }
 
-static void spmd_mem_frag_rx(struct arm_smccc_res *res, u32 handle_lo,
+static void ffa_mem_frag_rx(struct arm_smccc_res *res, u32 handle_lo,
 			     u32 handle_hi, u32 fragoff)
 {
 	arm_smccc_1_1_smc(FFA_MEM_FRAG_RX,
@@ -144,7 +152,7 @@ static void spmd_mem_frag_rx(struct arm_smccc_res *res, u32 handle_lo,
 			  res);
 }
 
-static void spmd_mem_xfer(struct arm_smccc_res *res, u64 func_id, u32 len,
+static void ffa_mem_xfer(struct arm_smccc_res *res, u64 func_id, u32 len,
 			  u32 fraglen)
 {
 	arm_smccc_1_1_smc(func_id, len, fraglen,
@@ -152,7 +160,7 @@ static void spmd_mem_xfer(struct arm_smccc_res *res, u64 func_id, u32 len,
 			  res);
 }
 
-static void spmd_mem_reclaim(struct arm_smccc_res *res, u32 handle_lo,
+static void ffa_mem_reclaim(struct arm_smccc_res *res, u32 handle_lo,
 			     u32 handle_hi, u32 flags)
 {
 	arm_smccc_1_1_smc(FFA_MEM_RECLAIM,
@@ -161,7 +169,7 @@ static void spmd_mem_reclaim(struct arm_smccc_res *res, u32 handle_lo,
 			  res);
 }
 
-static void spmd_retrieve_req(struct arm_smccc_res *res, u32 len)
+static void ffa_retrieve_req(struct arm_smccc_res *res, u32 len)
 {
 	arm_smccc_1_1_smc(FFA_FN64_MEM_RETRIEVE_REQ,
 			  len, len,
@@ -188,13 +196,17 @@ static void do_ffa_rxtx_map(struct arm_smccc_res *res,
 		goto out;
 	}
 
-	hyp_spin_lock(&host_kvm.ffa.lock);
-	if (host_kvm.ffa.tx) {
+	hyp_spin_lock(&host_buffers.lock);
+	if (host_buffers.tx) {
 		ret = FFA_RET_DENIED;
 		goto out_unlock;
 	}
 
-	ret = spmd_map_ffa_buffers(npages);
+	/*
+	 * Map our hypervisor buffers into the SPMD before mapping and
+	 * pinning the host buffers in our own address space.
+	 */
+	ret = ffa_map_hyp_buffers(npages);
 	if (ret)
 		goto out_unlock;
 
@@ -224,11 +236,11 @@ static void do_ffa_rxtx_map(struct arm_smccc_res *res,
 		goto err_unpin_tx;
 	}
 
-	host_kvm.ffa.tx = tx_virt;
-	host_kvm.ffa.rx = rx_virt;
+	host_buffers.tx = tx_virt;
+	host_buffers.rx = rx_virt;
 
 out_unlock:
-	hyp_spin_unlock(&host_kvm.ffa.lock);
+	hyp_spin_unlock(&host_buffers.lock);
 out:
 	ffa_to_smccc_res(res, ret);
 	return;
@@ -240,7 +252,7 @@ err_unshare_rx:
 err_unshare_tx:
 	__pkvm_host_unshare_hyp(hyp_phys_to_pfn(tx));
 err_unmap:
-	spmd_unmap_ffa_buffers();
+	ffa_unmap_hyp_buffers();
 	goto out_unlock;
 }
 
@@ -255,24 +267,24 @@ static void do_ffa_rxtx_unmap(struct arm_smccc_res *res,
 		goto out;
 	}
 
-	hyp_spin_lock(&host_kvm.ffa.lock);
-	if (!host_kvm.ffa.tx) {
+	hyp_spin_lock(&host_buffers.lock);
+	if (!host_buffers.tx) {
 		ret = FFA_RET_INVALID_PARAMETERS;
 		goto out_unlock;
 	}
 
-	hyp_unpin_shared_mem(host_kvm.ffa.tx, host_kvm.ffa.tx + 1);
-	WARN_ON(__pkvm_host_unshare_hyp(hyp_virt_to_pfn(host_kvm.ffa.tx)));
-	host_kvm.ffa.tx = NULL;
+	hyp_unpin_shared_mem(host_buffers.tx, host_buffers.tx + 1);
+	WARN_ON(__pkvm_host_unshare_hyp(hyp_virt_to_pfn(host_buffers.tx)));
+	host_buffers.tx = NULL;
 
-	hyp_unpin_shared_mem(host_kvm.ffa.rx, host_kvm.ffa.rx + 1);
-	WARN_ON(__pkvm_host_unshare_hyp(hyp_virt_to_pfn(host_kvm.ffa.rx)));
-	host_kvm.ffa.rx = NULL;
+	hyp_unpin_shared_mem(host_buffers.rx, host_buffers.rx + 1);
+	WARN_ON(__pkvm_host_unshare_hyp(hyp_virt_to_pfn(host_buffers.rx)));
+	host_buffers.rx = NULL;
 
-	spmd_unmap_ffa_buffers();
+	ffa_unmap_hyp_buffers();
 
 out_unlock:
-	hyp_spin_unlock(&host_kvm.ffa.lock);
+	hyp_spin_unlock(&host_buffers.lock);
 out:
 	ffa_to_smccc_res(res, ret);
 }
@@ -362,12 +374,12 @@ static void do_ffa_mem_frag_tx(struct arm_smccc_res *res,
 	if (fraglen % sizeof(*buf))
 		goto out;
 
-	hyp_spin_lock(&host_kvm.ffa.lock);
-	if (!host_kvm.ffa.tx)
+	hyp_spin_lock(&host_buffers.lock);
+	if (!host_buffers.tx)
 		goto out_unlock;
 
-	buf = ffa_buffers.tx;
-	memcpy(buf, host_kvm.ffa.tx, fraglen);
+	buf = hyp_buffers.tx;
+	memcpy(buf, host_buffers.tx, fraglen);
 	nr_ranges = fraglen / sizeof(*buf);
 
 	ret = ffa_host_share_ranges(buf, nr_ranges);
@@ -377,17 +389,17 @@ static void do_ffa_mem_frag_tx(struct arm_smccc_res *res,
 		 * to restore the global state back to what it was prior to
 		 * transmission of the first fragment.
 		 */
-		spmd_mem_reclaim(res, handle_lo, handle_hi, 0);
+		ffa_mem_reclaim(res, handle_lo, handle_hi, 0);
 		WARN_ON(res->a0 != FFA_SUCCESS);
 		goto out_unlock;
 	}
 
-	spmd_mem_frag_tx(res, handle_lo, handle_hi, fraglen, endpoint_id);
+	ffa_mem_frag_tx(res, handle_lo, handle_hi, fraglen, endpoint_id);
 	if (res->a0 != FFA_SUCCESS && res->a0 != FFA_MEM_FRAG_RX)
 		WARN_ON(ffa_host_unshare_ranges(buf, nr_ranges));
 
 out_unlock:
-	hyp_spin_unlock(&host_kvm.ffa.lock);
+	hyp_spin_unlock(&host_buffers.lock);
 out:
 	if (ret)
 		ffa_to_smccc_res(res, ret);
@@ -431,14 +443,14 @@ static __always_inline void do_ffa_mem_xfer(const u64 func_id,
 		goto out;
 	}
 
-	hyp_spin_lock(&host_kvm.ffa.lock);
-	if (!host_kvm.ffa.tx) {
+	hyp_spin_lock(&host_buffers.lock);
+	if (!host_buffers.tx) {
 		ret = FFA_RET_INVALID_PARAMETERS;
 		goto out_unlock;
 	}
 
-	buf = ffa_buffers.tx;
-	memcpy(buf, host_kvm.ffa.tx, fraglen);
+	buf = hyp_buffers.tx;
+	memcpy(buf, host_buffers.tx, fraglen);
 
 	offset = buf->ep_mem_access[0].composite_off;
 	if (!offset || buf->ep_count != 1 || buf->sender_id != HOST_FFA_ID) {
@@ -463,7 +475,7 @@ static __always_inline void do_ffa_mem_xfer(const u64 func_id,
 	if (ret)
 		goto out_unlock;
 
-	spmd_mem_xfer(res, func_id, len, fraglen);
+	ffa_mem_xfer(res, func_id, len, fraglen);
 	if (fraglen != len) {
 		if (res->a0 != FFA_MEM_FRAG_RX)
 			goto err_unshare;
@@ -475,7 +487,7 @@ static __always_inline void do_ffa_mem_xfer(const u64 func_id,
 	}
 
 out_unlock:
-	hyp_spin_unlock(&host_kvm.ffa.lock);
+	hyp_spin_unlock(&host_buffers.lock);
 out:
 	if (ret)
 		ffa_to_smccc_res(res, ret);
@@ -500,16 +512,16 @@ static void do_ffa_mem_reclaim(struct arm_smccc_res *res,
 
 	handle = PACK_HANDLE(handle_lo, handle_hi);
 
-	hyp_spin_lock(&host_kvm.ffa.lock);
+	hyp_spin_lock(&host_buffers.lock);
 
-	buf = ffa_buffers.tx;
+	buf = hyp_buffers.tx;
 	*buf = (struct ffa_mem_region) {
 		.sender_id	= HOST_FFA_ID,
 		.handle		= handle,
 	};
 
-	spmd_retrieve_req(res, sizeof(*buf));
-	buf = ffa_buffers.rx;
+	ffa_retrieve_req(res, sizeof(*buf));
+	buf = hyp_buffers.rx;
 	if (res->a0 != FFA_MEM_RETRIEVE_RESP)
 		goto out_unlock;
 
@@ -534,20 +546,20 @@ static void do_ffa_mem_reclaim(struct arm_smccc_res *res,
 	}
 
 	buf = ffa_desc_buf.buf;
-	memcpy(buf, ffa_buffers.rx, fraglen);
+	memcpy(buf, hyp_buffers.rx, fraglen);
 
 	for (fragoff = fraglen; fragoff < len; fragoff += fraglen) {
-		spmd_mem_frag_rx(res, handle_lo, handle_hi, fragoff);
+		ffa_mem_frag_rx(res, handle_lo, handle_hi, fragoff);
 		if (res->a0 != FFA_MEM_FRAG_TX) {
 			ret = FFA_RET_INVALID_PARAMETERS;
 			goto out_unlock;
 		}
 
 		fraglen = res->a3;
-		memcpy((void *)buf + fragoff, ffa_buffers.rx, fraglen);
+		memcpy((void *)buf + fragoff, hyp_buffers.rx, fraglen);
 	}
 
-	spmd_mem_reclaim(res, handle_lo, handle_hi, flags);
+	ffa_mem_reclaim(res, handle_lo, handle_hi, flags);
 	if (res->a0 != FFA_SUCCESS)
 		goto out_unlock;
 
@@ -556,14 +568,17 @@ static void do_ffa_mem_reclaim(struct arm_smccc_res *res,
 	WARN_ON(ffa_host_unshare_ranges(reg->constituents,
 					reg->addr_range_cnt));
 out_unlock:
-	hyp_spin_unlock(&host_kvm.ffa.lock);
+	hyp_spin_unlock(&host_buffers.lock);
 
 	if (ret)
 		ffa_to_smccc_res(res, ret);
-	return;
 }
 
-static bool ffa_call_unsupported(u64 func_id)
+/*
+ * Is a given FFA function supported, either by forwarding on directly
+ * or by handling at EL2?
+ */
+static bool ffa_call_supported(u64 func_id)
 {
 	switch (func_id) {
 	/* Unsupported memory management calls */
@@ -584,10 +599,10 @@ static bool ffa_call_unsupported(u64 func_id)
 	case FFA_RXTX_MAP:
 	case FFA_MEM_DONATE:
 	case FFA_MEM_RETRIEVE_REQ:
-		return true;
+		return false;
 	}
 
-	return false;
+	return true;
 }
 
 static bool do_ffa_features(struct arm_smccc_res *res,
@@ -597,7 +612,7 @@ static bool do_ffa_features(struct arm_smccc_res *res,
 	u64 prop = 0;
 	int ret = 0;
 
-	if (ffa_call_unsupported(id)) {
+	if (!ffa_call_supported(id)) {
 		ret = FFA_RET_NOT_SUPPORTED;
 		goto out_handled;
 	}
@@ -619,11 +634,23 @@ out_handled:
 	return true;
 }
 
-bool kvm_host_ffa_handler(struct kvm_cpu_context *host_ctxt)
+bool kvm_host_ffa_handler(struct kvm_cpu_context *host_ctxt, u32 func_id)
 {
-	DECLARE_REG(u64, func_id, host_ctxt, 0);
 	struct arm_smccc_res res;
 
+	/*
+	 * There's no way we can tell what a non-standard SMC call might
+	 * be up to. Ideally, we would terminate these here and return
+	 * an error to the host, but sadly devices make use of custom
+	 * firmware calls for things like power management, debugging,
+	 * RNG access and crash reporting.
+	 *
+	 * Given that the architecture requires us to trust EL3 anyway,
+	 * we forward unrecognised calls on under the assumption that
+	 * the firmware doesn't expose a mechanism to access arbitrary
+	 * non-secure memory. Short of a per-device table of SMCs, this
+	 * is the best we can do.
+	 */
 	if (!is_ffa_call(func_id))
 		return false;
 
@@ -655,7 +682,7 @@ bool kvm_host_ffa_handler(struct kvm_cpu_context *host_ctxt)
 		goto out_handled;
 	}
 
-	if (!ffa_call_unsupported(func_id))
+	if (ffa_call_supported(func_id))
 		return false; /* Pass through */
 
 	ffa_to_smccc_error(&res, FFA_RET_NOT_SUPPORTED);
@@ -670,14 +697,27 @@ int hyp_ffa_init(void *pages)
 	size_t min_rxtx_sz;
 	void *tx, *rx;
 
-	if (kvm_host_psci_config.smccc_version < ARM_SMCCC_VERSION_1_1)
+	if (kvm_host_psci_config.smccc_version < ARM_SMCCC_VERSION_1_2)
 		return 0;
 
 	arm_smccc_1_1_smc(FFA_VERSION, FFA_VERSION_1_0, 0, 0, 0, 0, 0, 0, &res);
 	if (res.a0 == FFA_RET_NOT_SUPPORTED)
 		return 0;
 
-	if (res.a0 != FFA_VERSION_1_0)
+	/*
+	 * Firmware returns the maximum supported version of the FF-A
+	 * implementation. Check that the returned version is
+	 * backwards-compatible with the hyp according to the rules in DEN0077A
+	 * v1.1 REL0 13.2.1.
+	 *
+	 * Of course, things are never simple when dealing with firmware. v1.1
+	 * broke ABI with v1.0 on several structures, which is itself
+	 * incompatible with the aforementioned versioning scheme. The
+	 * expectation is that v1.x implementations that do not support the v1.0
+	 * ABI return NOT_SUPPORTED rather than a version number, according to
+	 * DEN0077A v1.1 REL0 18.6.4.
+	 */
+	if (FFA_MAJOR_VERSION(res.a0) != 1)
 		return -EOPNOTSUPP;
 
 	arm_smccc_1_1_smc(FFA_ID_GET, 0, 0, 0, 0, 0, 0, 0, &res);
@@ -720,13 +760,13 @@ int hyp_ffa_init(void *pages)
 			  (hyp_ffa_proxy_pages() - (2 * KVM_FFA_MBOX_NR_PAGES)),
 	};
 
-	ffa_buffers = (struct kvm_ffa_buffers) {
+	hyp_buffers = (struct kvm_ffa_buffers) {
 		.lock	= __HYP_SPIN_LOCK_UNLOCKED,
 		.tx	= tx,
 		.rx	= rx,
 	};
 
-	host_kvm.ffa = (struct kvm_ffa_buffers) {
+	host_buffers = (struct kvm_ffa_buffers) {
 		.lock	= __HYP_SPIN_LOCK_UNLOCKED,
 	};
 

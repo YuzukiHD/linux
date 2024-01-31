@@ -14,7 +14,6 @@
 #include <linux/netfilter/x_tables.h>
 #include <linux/stringify.h>
 #include <linux/vmalloc.h>
-#include <linux/android_kabi.h>
 #include <net/netlink.h>
 #include <uapi/linux/netfilter/ipset/ip_set.h>
 
@@ -189,8 +188,6 @@ struct ip_set_type_variant {
 	bool (*same_set)(const struct ip_set *a, const struct ip_set *b);
 	/* Region-locking is used */
 	bool region_lock;
-
-	ANDROID_KABI_RESERVE(1);
 };
 
 struct ip_set_region {
@@ -237,8 +234,6 @@ struct ip_set_type {
 
 	/* Set this to THIS_MODULE if you are a module, otherwise NULL */
 	struct module *me;
-
-	ANDROID_KABI_RESERVE(1);
 };
 
 /* register and unregister set type */
@@ -281,8 +276,6 @@ struct ip_set {
 	size_t offset[IPSET_EXT_ID_MAX];
 	/* The type specific data */
 	void *data;
-
-	ANDROID_KABI_RESERVE(1);
 };
 
 static inline void
@@ -520,6 +513,16 @@ ip_set_init_skbinfo(struct ip_set_skbinfo *skbinfo,
 		    const struct ip_set_ext *ext)
 {
 	*skbinfo = ext->skbinfo;
+}
+
+static inline void
+nf_inet_addr_mask_inplace(union nf_inet_addr *a1,
+			  const union nf_inet_addr *mask)
+{
+	a1->all[0] &= mask->all[0];
+	a1->all[1] &= mask->all[1];
+	a1->all[2] &= mask->all[2];
+	a1->all[3] &= mask->all[3];
 }
 
 #define IP_SET_INIT_KEXT(skb, opt, set)			\

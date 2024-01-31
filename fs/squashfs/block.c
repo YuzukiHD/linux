@@ -19,7 +19,6 @@
 #include <linux/slab.h>
 #include <linux/pagemap.h>
 #include <linux/string.h>
-#include <linux/buffer_head.h>
 #include <linux/bio.h>
 
 #include "squashfs_fs.h"
@@ -82,6 +81,7 @@ static int squashfs_bio_read_cached(struct bio *fullbio,
 		u64 read_start, u64 read_end, int page_count)
 {
 	struct page *head_to_cache = NULL, *tail_to_cache = NULL;
+	struct block_device *bdev = fullbio->bi_bdev;
 	int start_idx = 0, end_idx = 0;
 	struct bvec_iter_all iter_all;
 	struct bio *bio = NULL;
@@ -112,7 +112,7 @@ static int squashfs_bio_read_cached(struct bio *fullbio,
 			tail_to_cache = page;
 
 		if (!bio || idx != end_idx) {
-			struct bio *new = bio_clone_fast(fullbio,
+			struct bio *new = bio_alloc_clone(bdev, fullbio,
 							  GFP_NOIO, &fs_bio_set);
 
 			if (bio) {
@@ -201,16 +201,10 @@ static int squashfs_bio_read(struct super_block *sb, u64 index, int length,
 	int error, i;
 	struct bio *bio;
 
-	if (page_count <= BIO_MAX_VECS)
-		bio = bio_alloc(GFP_NOIO, page_count);
-	else
-		bio = bio_kmalloc(GFP_NOIO, page_count);
-
+	bio = bio_kmalloc(page_count, GFP_NOIO);
 	if (!bio)
 		return -ENOMEM;
-
-	bio_set_dev(bio, sb->s_bdev);
-	bio->bi_opf = READ;
+	bio_init(bio, sb->s_bdev, bio->bi_inline_vecs, page_count, REQ_OP_READ);
 	bio->bi_iter.bi_sector = block * (msblk->devblksize >> SECTOR_SHIFT);
 
 	for (i = 0; i < page_count; ++i) {
@@ -252,7 +246,8 @@ static int squashfs_bio_read(struct super_block *sb, u64 index, int length,
 
 out_free_bio:
 	bio_free_pages(bio);
-	bio_put(bio);
+	bio_uninit(bio);
+	kfree(bio);
 	return error;
 }
 
@@ -316,7 +311,8 @@ int squashfs_read_data(struct super_block *sb, u64 index, int length,
 			length |= data[0] << 8;
 		}
 		bio_free_pages(bio);
-		bio_put(bio);
+		bio_uninit(bio);
+		kfree(bio);
 
 		compressed = SQUASHFS_COMPRESSED(length);
 		length = SQUASHFS_COMPRESSED_SIZE(length);
@@ -343,14 +339,15 @@ int squashfs_read_data(struct super_block *sb, u64 index, int length,
 			res = -EIO;
 			goto out_free_bio;
 		}
-		res = squashfs_decompress(msblk, bio, offset, length, output);
+		res = msblk->thread_ops->decompress(msblk, bio, offset, length, output);
 	} else {
 		res = copy_bio_to_actor(bio, output, offset, length);
 	}
 
 out_free_bio:
 	bio_free_pages(bio);
-	bio_put(bio);
+	bio_uninit(bio);
+	kfree(bio);
 out:
 	if (res < 0) {
 		ERROR("Failed to read block 0x%llx: %d\n", index, res);

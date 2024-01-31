@@ -152,7 +152,6 @@ int stop_one_cpu(unsigned int cpu, cpu_stop_fn_t fn, void *arg)
 	wait_for_completion(&done.completion);
 	return done.ret;
 }
-EXPORT_SYMBOL_GPL(stop_one_cpu);
 
 /* This controls the threads on each CPU. */
 enum multi_stop_state {
@@ -388,7 +387,6 @@ bool stop_one_cpu_nowait(unsigned int cpu, cpu_stop_fn_t fn, void *arg,
 	*work_buf = (struct cpu_stop_work){ .fn = fn, .arg = arg, .caller = _RET_IP_, };
 	return cpu_stop_queue_work(cpu, work_buf);
 }
-EXPORT_SYMBOL_GPL(stop_one_cpu_nowait);
 
 static bool queue_stop_cpus_work(const struct cpumask *cpumask,
 				 cpu_stop_fn_t fn, void *arg,
@@ -537,8 +535,6 @@ void stop_machine_park(int cpu)
 	kthread_park(stopper->thread);
 }
 
-extern void sched_set_stop_task(int cpu, struct task_struct *stop);
-
 static void cpu_stop_create(unsigned int cpu)
 {
 	sched_set_stop_task(cpu, per_cpu(cpu_stopper.thread, cpu));
@@ -634,6 +630,27 @@ int stop_machine(cpu_stop_fn_t fn, void *data, const struct cpumask *cpus)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(stop_machine);
+
+#ifdef CONFIG_SCHED_SMT
+int stop_core_cpuslocked(unsigned int cpu, cpu_stop_fn_t fn, void *data)
+{
+	const struct cpumask *smt_mask = cpu_smt_mask(cpu);
+
+	struct multi_stop_data msdata = {
+		.fn = fn,
+		.data = data,
+		.num_threads = cpumask_weight(smt_mask),
+		.active_cpus = smt_mask,
+	};
+
+	lockdep_assert_cpus_held();
+
+	/* Set the initial state and stop all online cpus. */
+	set_state(&msdata, MULTI_STOP_PREPARE);
+	return stop_cpus(smt_mask, multi_cpu_stop, &msdata);
+}
+EXPORT_SYMBOL_GPL(stop_core_cpuslocked);
+#endif
 
 /**
  * stop_machine_from_inactive_cpu - stop_machine() from inactive CPU

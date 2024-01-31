@@ -1,4 +1,0 @@
-arch: arm
-type: ramfs
-version: 1.0.0
-toolchain: 

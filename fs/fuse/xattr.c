@@ -42,10 +42,9 @@ int fuse_setxattr(struct inode *inode, const char *name, const void *value,
 		fm->fc->no_setxattr = 1;
 		err = -EOPNOTSUPP;
 	}
-	if (!err) {
-		fuse_invalidate_attr(inode);
+	if (!err)
 		fuse_update_ctime(inode);
-	}
+
 	return err;
 }
 
@@ -116,17 +115,6 @@ ssize_t fuse_listxattr(struct dentry *entry, char *list, size_t size)
 	struct fuse_getxattr_out outarg;
 	ssize_t ret;
 
-#ifdef CONFIG_FUSE_BPF
-	struct fuse_err_ret fer;
-
-	fer = fuse_bpf_backing(inode, struct fuse_getxattr_io,
-			       fuse_listxattr_initialize,
-			       fuse_listxattr_backing, fuse_listxattr_finalize,
-			       entry, list, size);
-	if (fer.ret)
-		return PTR_ERR(fer.result);
-#endif
-
 	if (fuse_is_bad(inode))
 		return -EIO;
 
@@ -184,10 +172,9 @@ int fuse_removexattr(struct inode *inode, const char *name)
 		fm->fc->no_removexattr = 1;
 		err = -EOPNOTSUPP;
 	}
-	if (!err) {
-		fuse_invalidate_attr(inode);
+	if (!err)
 		fuse_update_ctime(inode);
-	}
+
 	return err;
 }
 
@@ -195,17 +182,6 @@ static int fuse_xattr_get(const struct xattr_handler *handler,
 			 struct dentry *dentry, struct inode *inode,
 			 const char *name, void *value, size_t size)
 {
-#ifdef CONFIG_FUSE_BPF
-	struct fuse_err_ret fer;
-
-	fer = fuse_bpf_backing(inode, struct fuse_getxattr_io,
-			       fuse_getxattr_initialize, fuse_getxattr_backing,
-			       fuse_getxattr_finalize,
-			       dentry, name, value, size);
-	if (fer.ret)
-		return PTR_ERR(fer.result);
-#endif
-
 	if (fuse_is_bad(inode))
 		return -EIO;
 
@@ -213,29 +189,11 @@ static int fuse_xattr_get(const struct xattr_handler *handler,
 }
 
 static int fuse_xattr_set(const struct xattr_handler *handler,
-			  struct user_namespace *mnt_userns,
+			  struct mnt_idmap *idmap,
 			  struct dentry *dentry, struct inode *inode,
 			  const char *name, const void *value, size_t size,
 			  int flags)
 {
-#ifdef CONFIG_FUSE_BPF
-	struct fuse_err_ret fer;
-
-	if (value)
-		fer = fuse_bpf_backing(inode, struct fuse_setxattr_in,
-			       fuse_setxattr_initialize, fuse_setxattr_backing,
-			       fuse_setxattr_finalize, dentry, name, value,
-			       size, flags);
-	else
-		fer = fuse_bpf_backing(inode, struct fuse_dummy_io,
-				       fuse_removexattr_initialize,
-				       fuse_removexattr_backing,
-				       fuse_removexattr_finalize,
-				       dentry, name);
-	if (fer.ret)
-		return PTR_ERR(fer.result);
-#endif
-
 	if (fuse_is_bad(inode))
 		return -EIO;
 
@@ -245,27 +203,6 @@ static int fuse_xattr_set(const struct xattr_handler *handler,
 	return fuse_setxattr(inode, name, value, size, flags, 0);
 }
 
-static bool no_xattr_list(struct dentry *dentry)
-{
-	return false;
-}
-
-static int no_xattr_get(const struct xattr_handler *handler,
-			struct dentry *dentry, struct inode *inode,
-			const char *name, void *value, size_t size)
-{
-	return -EOPNOTSUPP;
-}
-
-static int no_xattr_set(const struct xattr_handler *handler,
-			struct user_namespace *mnt_userns,
-			struct dentry *dentry, struct inode *nodee,
-			const char *name, const void *value,
-			size_t size, int flags)
-{
-	return -EOPNOTSUPP;
-}
-
 static const struct xattr_handler fuse_xattr_handler = {
 	.prefix = "",
 	.get    = fuse_xattr_get,
@@ -273,36 +210,6 @@ static const struct xattr_handler fuse_xattr_handler = {
 };
 
 const struct xattr_handler *fuse_xattr_handlers[] = {
-	&fuse_xattr_handler,
-	NULL
-};
-
-const struct xattr_handler *fuse_acl_xattr_handlers[] = {
-	&posix_acl_access_xattr_handler,
-	&posix_acl_default_xattr_handler,
-	&fuse_xattr_handler,
-	NULL
-};
-
-static const struct xattr_handler fuse_no_acl_access_xattr_handler = {
-	.name  = XATTR_NAME_POSIX_ACL_ACCESS,
-	.flags = ACL_TYPE_ACCESS,
-	.list  = no_xattr_list,
-	.get   = no_xattr_get,
-	.set   = no_xattr_set,
-};
-
-static const struct xattr_handler fuse_no_acl_default_xattr_handler = {
-	.name  = XATTR_NAME_POSIX_ACL_DEFAULT,
-	.flags = ACL_TYPE_ACCESS,
-	.list  = no_xattr_list,
-	.get   = no_xattr_get,
-	.set   = no_xattr_set,
-};
-
-const struct xattr_handler *fuse_no_acl_xattr_handlers[] = {
-	&fuse_no_acl_access_xattr_handler,
-	&fuse_no_acl_default_xattr_handler,
 	&fuse_xattr_handler,
 	NULL
 };

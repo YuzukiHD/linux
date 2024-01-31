@@ -480,6 +480,7 @@ enum v4l2_pixel_encoding {
  * @mem_planes: Number of memory planes, which includes the alpha plane (1 to 4).
  * @comp_planes: Number of component planes, which includes the alpha plane (1 to 4).
  * @bpp: Array of per-plane bytes per pixel
+ * @bpp_div: Array of per-plane bytes per pixel divisors to support fractional pixel sizes.
  * @hdiv: Horizontal chroma subsampling factor
  * @vdiv: Vertical chroma subsampling factor
  * @block_w: Per-plane macroblock pixel width (optional)
@@ -491,6 +492,7 @@ struct v4l2_format_info {
 	u8 mem_planes;
 	u8 comp_planes;
 	u8 bpp[4];
+	u8 bpp_div[4];
 	u8 hdiv;
 	u8 vdiv;
 	u8 block_w[4];
@@ -568,19 +570,19 @@ static inline void v4l2_buffer_set_timestamp(struct v4l2_buffer *buf,
 static inline bool v4l2_is_colorspace_valid(__u32 colorspace)
 {
 	return colorspace > V4L2_COLORSPACE_DEFAULT &&
-	       colorspace <= V4L2_COLORSPACE_DCI_P3;
+	       colorspace < V4L2_COLORSPACE_LAST;
 }
 
 static inline bool v4l2_is_xfer_func_valid(__u32 xfer_func)
 {
 	return xfer_func > V4L2_XFER_FUNC_DEFAULT &&
-	       xfer_func <= V4L2_XFER_FUNC_SMPTE2084;
+	       xfer_func < V4L2_XFER_FUNC_LAST;
 }
 
 static inline bool v4l2_is_ycbcr_enc_valid(__u8 ycbcr_enc)
 {
 	return ycbcr_enc > V4L2_YCBCR_ENC_DEFAULT &&
-	       ycbcr_enc <= V4L2_YCBCR_ENC_SMPTE240M;
+	       ycbcr_enc < V4L2_YCBCR_ENC_LAST;
 }
 
 static inline bool v4l2_is_hsv_enc_valid(__u8 hsv_enc)

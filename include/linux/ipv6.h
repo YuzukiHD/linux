@@ -3,7 +3,6 @@
 #define _IPV6_H
 
 #include <uapi/linux/ipv6.h>
-#include <linux/android_kabi.h>
 
 #define ipv6_optlen(p)  (((p)->hdrlen+1) << 3)
 #define ipv6_authlen(p) (((p)->hdrlen+2) << 2)
@@ -34,6 +33,7 @@ struct ipv6_devconf {
 	__s32		accept_ra_defrtr;
 	__u32		ra_defrtr_metric;
 	__s32		accept_ra_min_hop_limit;
+	__s32		accept_ra_min_lft;
 	__s32		accept_ra_pinfo;
 	__s32		ignore_routes_with_linkdown;
 #ifdef CONFIG_IPV6_ROUTER_PREF
@@ -44,7 +44,6 @@ struct ipv6_devconf {
 	__s32		accept_ra_rt_info_max_plen;
 #endif
 #endif
-	__s32		accept_ra_rt_table;
 	__s32		proxy_ndp;
 	__s32		accept_source_route;
 	__s32		accept_ra_from_local;
@@ -63,6 +62,7 @@ struct ipv6_devconf {
 	__s32		suppress_frag_ndisc;
 	__s32		accept_ra_mtu;
 	__s32		drop_unsolicited_na;
+	__s32		accept_untracked_na;
 	struct ipv6_stable_secret {
 		bool initialized;
 		struct in6_addr secret;
@@ -81,13 +81,9 @@ struct ipv6_devconf {
 	__u32		ioam6_id;
 	__u32		ioam6_id_wide;
 	__u8		ioam6_enabled;
+	__u8		ndisc_evict_nocarrier;
 
 	struct ctl_table_header *sysctl_header;
-
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
-	ANDROID_KABI_RESERVE(3);
-	ANDROID_KABI_RESERVE(4);
 };
 
 struct ipv6_params {
@@ -150,6 +146,8 @@ struct inet6_skb_parm {
 #define IP6SKB_L3SLAVE         64
 #define IP6SKB_JUMBOGRAM      128
 #define IP6SKB_SEG6	      256
+#define IP6SKB_FAKEJUMBO      512
+#define IP6SKB_MULTIPATH      1024
 };
 
 #if defined(CONFIG_NET_L3_MASTER_DEV)
@@ -203,14 +201,7 @@ struct inet6_cork {
 	u8 tclass;
 };
 
-/**
- * struct ipv6_pinfo - ipv6 private area
- *
- * In the struct sock hierarchy (tcp6_sock, upd6_sock, etc)
- * this _must_ be the last member, so that inet6_sk_generic
- * is able to calculate its offset from the base struct sock
- * by using the struct proto->slab_obj_size member. -acme
- */
+/* struct ipv6_pinfo - ipv6 private area */
 struct ipv6_pinfo {
 	struct in6_addr 	saddr;
 	struct in6_pktinfo	sticky_pktinfo;
@@ -310,19 +301,19 @@ struct raw6_sock {
 	__u32			offset;		/* checksum offset  */
 	struct icmp6_filter	filter;
 	__u32			ip6mr_table;
-	/* ipv6_pinfo has to be the last member of raw6_sock, see inet6_sk_generic */
+
 	struct ipv6_pinfo	inet6;
 };
 
 struct udp6_sock {
 	struct udp_sock	  udp;
-	/* ipv6_pinfo has to be the last member of udp6_sock, see inet6_sk_generic */
+
 	struct ipv6_pinfo inet6;
 };
 
 struct tcp6_sock {
 	struct tcp_sock	  tcp;
-	/* ipv6_pinfo has to be the last member of tcp6_sock, see inet6_sk_generic */
+
 	struct ipv6_pinfo inet6;
 };
 
@@ -340,13 +331,9 @@ static inline struct ipv6_pinfo *inet6_sk(const struct sock *__sk)
 	return sk_fullsock(__sk) ? inet_sk(__sk)->pinet6 : NULL;
 }
 
-static inline struct raw6_sock *raw6_sk(const struct sock *sk)
-{
-	return (struct raw6_sock *)sk;
-}
+#define raw6_sk(ptr) container_of_const(ptr, struct raw6_sock, inet.sk)
 
-#define __ipv6_only_sock(sk)	(sk->sk_ipv6only)
-#define ipv6_only_sock(sk)	(__ipv6_only_sock(sk))
+#define ipv6_only_sock(sk)	(sk->sk_ipv6only)
 #define ipv6_sk_rxinfo(sk)	((sk)->sk_family == PF_INET6 && \
 				 inet6_sk(sk)->rxopt.bits.rxinfo)
 
@@ -363,7 +350,6 @@ static inline int inet_v6_ipv6only(const struct sock *sk)
 	return ipv6_only_sock(sk);
 }
 #else
-#define __ipv6_only_sock(sk)	0
 #define ipv6_only_sock(sk)	0
 #define ipv6_sk_rxinfo(sk)	0
 
@@ -377,19 +363,12 @@ static inline struct ipv6_pinfo * inet6_sk(const struct sock *__sk)
 	return NULL;
 }
 
-static inline struct inet6_request_sock *
-			inet6_rsk(const struct request_sock *rsk)
-{
-	return NULL;
-}
-
 static inline struct raw6_sock *raw6_sk(const struct sock *sk)
 {
 	return NULL;
 }
 
 #define inet6_rcv_saddr(__sk)	NULL
-#define tcp_twsk_ipv6only(__sk)		0
 #define inet_v6_ipv6only(__sk)		0
 #endif /* IS_ENABLED(CONFIG_IPV6) */
 #endif /* _IPV6_H */

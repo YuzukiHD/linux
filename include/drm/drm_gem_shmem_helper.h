@@ -27,11 +27,6 @@ struct drm_gem_shmem_object {
 	struct drm_gem_object base;
 
 	/**
-	 * @pages_lock: Protects the page table and use count
-	 */
-	struct mutex pages_lock;
-
-	/**
 	 * @pages: Page table
 	 */
 	struct page **pages;
@@ -61,28 +56,9 @@ struct drm_gem_shmem_object {
 	struct list_head madv_list;
 
 	/**
-	 * @pages_mark_dirty_on_put:
-	 *
-	 * Mark pages as dirty when they are put.
-	 */
-	unsigned int pages_mark_dirty_on_put    : 1;
-
-	/**
-	 * @pages_mark_accessed_on_put:
-	 *
-	 * Mark pages as accessed when they are put.
-	 */
-	unsigned int pages_mark_accessed_on_put : 1;
-
-	/**
 	 * @sgt: Scatter/gather table for imported PRIME buffers
 	 */
 	struct sg_table *sgt;
-
-	/**
-	 * @vmap_lock: Protects the vmap address and use count
-	 */
-	struct mutex vmap_lock;
 
 	/**
 	 * @vaddr: Kernel virtual address of the backing memory
@@ -98,25 +74,41 @@ struct drm_gem_shmem_object {
 	unsigned int vmap_use_count;
 
 	/**
+	 * @pages_mark_dirty_on_put:
+	 *
+	 * Mark pages as dirty when they are put.
+	 */
+	bool pages_mark_dirty_on_put : 1;
+
+	/**
+	 * @pages_mark_accessed_on_put:
+	 *
+	 * Mark pages as accessed when they are put.
+	 */
+	bool pages_mark_accessed_on_put : 1;
+
+	/**
 	 * @map_wc: map object write-combined (instead of using shmem defaults).
 	 */
-	bool map_wc;
+	bool map_wc : 1;
 };
 
 #define to_drm_gem_shmem_obj(obj) \
 	container_of(obj, struct drm_gem_shmem_object, base)
 
 struct drm_gem_shmem_object *drm_gem_shmem_create(struct drm_device *dev, size_t size);
-void drm_gem_shmem_free_object(struct drm_gem_object *obj);
+void drm_gem_shmem_free(struct drm_gem_shmem_object *shmem);
 
-int drm_gem_shmem_get_pages(struct drm_gem_shmem_object *shmem);
 void drm_gem_shmem_put_pages(struct drm_gem_shmem_object *shmem);
-int drm_gem_shmem_pin(struct drm_gem_object *obj);
-void drm_gem_shmem_unpin(struct drm_gem_object *obj);
-int drm_gem_shmem_vmap(struct drm_gem_object *obj, struct dma_buf_map *map);
-void drm_gem_shmem_vunmap(struct drm_gem_object *obj, struct dma_buf_map *map);
+int drm_gem_shmem_pin(struct drm_gem_shmem_object *shmem);
+void drm_gem_shmem_unpin(struct drm_gem_shmem_object *shmem);
+int drm_gem_shmem_vmap(struct drm_gem_shmem_object *shmem,
+		       struct iosys_map *map);
+void drm_gem_shmem_vunmap(struct drm_gem_shmem_object *shmem,
+			  struct iosys_map *map);
+int drm_gem_shmem_mmap(struct drm_gem_shmem_object *shmem, struct vm_area_struct *vma);
 
-int drm_gem_shmem_madvise(struct drm_gem_object *obj, int madv);
+int drm_gem_shmem_madvise(struct drm_gem_shmem_object *shmem, int madv);
 
 static inline bool drm_gem_shmem_is_purgeable(struct drm_gem_shmem_object *shmem)
 {
@@ -125,33 +117,32 @@ static inline bool drm_gem_shmem_is_purgeable(struct drm_gem_shmem_object *shmem
 		!shmem->base.dma_buf && !shmem->base.import_attach;
 }
 
-void drm_gem_shmem_purge_locked(struct drm_gem_object *obj);
-bool drm_gem_shmem_purge(struct drm_gem_object *obj);
+void drm_gem_shmem_purge(struct drm_gem_shmem_object *shmem);
 
-int drm_gem_shmem_dumb_create(struct drm_file *file, struct drm_device *dev,
-			      struct drm_mode_create_dumb *args);
+struct sg_table *drm_gem_shmem_get_sg_table(struct drm_gem_shmem_object *shmem);
+struct sg_table *drm_gem_shmem_get_pages_sgt(struct drm_gem_shmem_object *shmem);
 
-int drm_gem_shmem_mmap(struct drm_gem_object *obj, struct vm_area_struct *vma);
+void drm_gem_shmem_print_info(const struct drm_gem_shmem_object *shmem,
+			      struct drm_printer *p, unsigned int indent);
 
-void drm_gem_shmem_print_info(struct drm_printer *p, unsigned int indent,
-			      const struct drm_gem_object *obj);
-
-struct sg_table *drm_gem_shmem_get_sg_table(struct drm_gem_object *obj);
+extern const struct vm_operations_struct drm_gem_shmem_vm_ops;
 
 /*
  * GEM object functions
  */
 
 /**
- * drm_gem_shmem_object_free - GEM object function for drm_gem_shmem_free_object()
+ * drm_gem_shmem_object_free - GEM object function for drm_gem_shmem_free()
  * @obj: GEM object to free
  *
- * This function wraps drm_gem_shmem_free_object(). Drivers that employ the shmem helpers
+ * This function wraps drm_gem_shmem_free(). Drivers that employ the shmem helpers
  * should use it as their &drm_gem_object_funcs.free handler.
  */
 static inline void drm_gem_shmem_object_free(struct drm_gem_object *obj)
 {
-	drm_gem_shmem_free_object(obj);
+	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
+
+	drm_gem_shmem_free(shmem);
 }
 
 /**
@@ -166,7 +157,9 @@ static inline void drm_gem_shmem_object_free(struct drm_gem_object *obj)
 static inline void drm_gem_shmem_object_print_info(struct drm_printer *p, unsigned int indent,
 						   const struct drm_gem_object *obj)
 {
-	drm_gem_shmem_print_info(p, indent, obj);
+	const struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
+
+	drm_gem_shmem_print_info(shmem, p, indent);
 }
 
 /**
@@ -178,7 +171,9 @@ static inline void drm_gem_shmem_object_print_info(struct drm_printer *p, unsign
  */
 static inline int drm_gem_shmem_object_pin(struct drm_gem_object *obj)
 {
-	return drm_gem_shmem_pin(obj);
+	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
+
+	return drm_gem_shmem_pin(shmem);
 }
 
 /**
@@ -190,7 +185,9 @@ static inline int drm_gem_shmem_object_pin(struct drm_gem_object *obj)
  */
 static inline void drm_gem_shmem_object_unpin(struct drm_gem_object *obj)
 {
-	drm_gem_shmem_unpin(obj);
+	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
+
+	drm_gem_shmem_unpin(shmem);
 }
 
 /**
@@ -201,11 +198,13 @@ static inline void drm_gem_shmem_object_unpin(struct drm_gem_object *obj)
  * use it as their &drm_gem_object_funcs.get_sg_table handler.
  *
  * Returns:
- * A pointer to the scatter/gather table of pinned pages or NULL on failure.
+ * A pointer to the scatter/gather table of pinned pages or error pointer on failure.
  */
 static inline struct sg_table *drm_gem_shmem_object_get_sg_table(struct drm_gem_object *obj)
 {
-	return drm_gem_shmem_get_sg_table(obj);
+	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
+
+	return drm_gem_shmem_get_sg_table(shmem);
 }
 
 /*
@@ -219,9 +218,12 @@ static inline struct sg_table *drm_gem_shmem_object_get_sg_table(struct drm_gem_
  * Returns:
  * 0 on success or a negative error code on failure.
  */
-static inline int drm_gem_shmem_object_vmap(struct drm_gem_object *obj, struct dma_buf_map *map)
+static inline int drm_gem_shmem_object_vmap(struct drm_gem_object *obj,
+					    struct iosys_map *map)
 {
-	return drm_gem_shmem_vmap(obj, map);
+	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
+
+	return drm_gem_shmem_vmap(shmem, map);
 }
 
 /*
@@ -232,9 +234,12 @@ static inline int drm_gem_shmem_object_vmap(struct drm_gem_object *obj, struct d
  * This function wraps drm_gem_shmem_vunmap(). Drivers that employ the shmem helpers should
  * use it as their &drm_gem_object_funcs.vunmap handler.
  */
-static inline void drm_gem_shmem_object_vunmap(struct drm_gem_object *obj, struct dma_buf_map *map)
+static inline void drm_gem_shmem_object_vunmap(struct drm_gem_object *obj,
+					       struct iosys_map *map)
 {
-	drm_gem_shmem_vunmap(obj, map);
+	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
+
+	drm_gem_shmem_vunmap(shmem, map);
 }
 
 /**
@@ -250,7 +255,9 @@ static inline void drm_gem_shmem_object_vunmap(struct drm_gem_object *obj, struc
  */
 static inline int drm_gem_shmem_object_mmap(struct drm_gem_object *obj, struct vm_area_struct *vma)
 {
-	return drm_gem_shmem_mmap(obj, vma);
+	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
+
+	return drm_gem_shmem_mmap(shmem, vma);
 }
 
 /*
@@ -261,8 +268,8 @@ struct drm_gem_object *
 drm_gem_shmem_prime_import_sg_table(struct drm_device *dev,
 				    struct dma_buf_attachment *attach,
 				    struct sg_table *sgt);
-
-struct sg_table *drm_gem_shmem_get_pages_sgt(struct drm_gem_object *obj);
+int drm_gem_shmem_dumb_create(struct drm_file *file, struct drm_device *dev,
+			      struct drm_mode_create_dumb *args);
 
 /**
  * DRM_GEM_SHMEM_DRIVER_OPS - Default shmem GEM operations
@@ -271,10 +278,7 @@ struct sg_table *drm_gem_shmem_get_pages_sgt(struct drm_gem_object *obj);
  * the &drm_driver structure.
  */
 #define DRM_GEM_SHMEM_DRIVER_OPS \
-	.prime_handle_to_fd	= drm_gem_prime_handle_to_fd, \
-	.prime_fd_to_handle	= drm_gem_prime_fd_to_handle, \
 	.gem_prime_import_sg_table = drm_gem_shmem_prime_import_sg_table, \
-	.gem_prime_mmap		= drm_gem_prime_mmap, \
-	.dumb_create		= drm_gem_shmem_dumb_create
+	.dumb_create		   = drm_gem_shmem_dumb_create
 
 #endif /* __DRM_GEM_SHMEM_HELPER_H__ */

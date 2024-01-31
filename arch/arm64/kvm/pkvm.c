@@ -4,22 +4,18 @@
  * Author: Quentin Perret <qperret@google.com>
  */
 
-#include <linux/io.h>
+#include <linux/init.h>
+#include <linux/kmemleak.h>
 #include <linux/kvm_host.h>
 #include <linux/memblock.h>
-#include <linux/mm.h>
 #include <linux/mutex.h>
-#include <linux/of_fdt.h>
-#include <linux/of_reserved_mem.h>
 #include <linux/sort.h>
 
 #include <asm/kvm_pkvm.h>
 
 #include "hyp_constants.h"
 
-static struct reserved_mem *pkvm_firmware_mem;
-static phys_addr_t *pvmfw_base = &kvm_nvhe_sym(pvmfw_base);
-static phys_addr_t *pvmfw_size = &kvm_nvhe_sym(pvmfw_size);
+DEFINE_STATIC_KEY_FALSE(kvm_protected_mode_initialized);
 
 static struct memblock_region *hyp_memory = kvm_nvhe_sym(hyp_memory);
 static unsigned int *hyp_memblock_nr_ptr = &kvm_nvhe_sym(hyp_memblock_nr);
@@ -80,7 +76,7 @@ void __init kvm_hyp_reserve(void)
 
 	hyp_mem_pages += hyp_s1_pgtable_pages();
 	hyp_mem_pages += host_s2_pgtable_pages();
-	hyp_mem_pages += hyp_shadow_table_pages(KVM_SHADOW_VM_SIZE);
+	hyp_mem_pages += hyp_vm_table_pages();
 	hyp_mem_pages += hyp_vmemmap_pages(STRUCT_HYP_PAGE_SIZE);
 	hyp_mem_pages += hyp_ffa_proxy_pages();
 
@@ -106,28 +102,29 @@ void __init kvm_hyp_reserve(void)
 }
 
 /*
- * Allocates and donates memory for EL2 shadow structs.
+ * Allocates and donates memory for hypervisor VM structs at EL2.
  *
- * Allocates space for the shadow state, which includes the shadow vm as well as
- * the shadow vcpu states.
+ * Allocates space for the VM state, which includes the hyp vm as well as
+ * the hyp vcpus.
  *
  * Stores an opaque handler in the kvm struct for future reference.
  *
  * Return 0 on success, negative error code on failure.
  */
-static int __create_el2_shadow(struct kvm *kvm)
+static int __pkvm_create_hyp_vm(struct kvm *host_kvm)
 {
-	struct kvm_vcpu *vcpu;
-	size_t pgd_sz, shadow_sz, vcpu_state_sz;
-	void *pgd, *shadow_addr;
+	size_t pgd_sz, hyp_vm_sz, hyp_vcpu_sz;
+	struct kvm_vcpu *host_vcpu;
+	pkvm_handle_t handle;
+	void *pgd, *hyp_vm;
 	unsigned long idx;
-	int shadow_handle;
 	int ret;
 
-	if (kvm->created_vcpus < 1)
+	if (host_kvm->created_vcpus < 1)
 		return -EINVAL;
 
-	pgd_sz = kvm_pgtable_stage2_pgd_size(kvm->arch.vtcr);
+	pgd_sz = kvm_pgtable_stage2_pgd_size(host_kvm->arch.vtcr);
+
 	/*
 	 * The PGD pages will be reclaimed using a hyp_memcache which implies
 	 * page granularity. So, use alloc_pages_exact() to get individual
@@ -137,46 +134,46 @@ static int __create_el2_shadow(struct kvm *kvm)
 	if (!pgd)
 		return -ENOMEM;
 
-	/* Allocate memory to donate to hyp for the kvm and vcpu state pointers. */
-	shadow_sz = PAGE_ALIGN(KVM_SHADOW_VM_SIZE +
-			       sizeof(void *) * kvm->created_vcpus);
-	shadow_addr = alloc_pages_exact(shadow_sz, GFP_KERNEL_ACCOUNT);
-	if (!shadow_addr) {
+	/* Allocate memory to donate to hyp for vm and vcpu pointers. */
+	hyp_vm_sz = PAGE_ALIGN(size_add(PKVM_HYP_VM_SIZE,
+					size_mul(sizeof(void *),
+						 host_kvm->created_vcpus)));
+	hyp_vm = alloc_pages_exact(hyp_vm_sz, GFP_KERNEL_ACCOUNT);
+	if (!hyp_vm) {
 		ret = -ENOMEM;
 		goto free_pgd;
 	}
 
-	/* Donate the shadow memory to hyp and let hyp initialize it. */
-	ret = kvm_call_hyp_nvhe(__pkvm_init_shadow, kvm, shadow_addr, shadow_sz,
-				pgd);
+	/* Donate the VM memory to hyp and let hyp initialize it. */
+	ret = kvm_call_hyp_nvhe(__pkvm_init_vm, host_kvm, hyp_vm, pgd);
 	if (ret < 0)
-		goto free_shadow;
+		goto free_vm;
 
-	shadow_handle = ret;
+	handle = ret;
 
-	/* Store the shadow handle given by hyp for future call reference. */
-	kvm->arch.pkvm.shadow_handle = shadow_handle;
+	host_kvm->arch.pkvm.handle = handle;
 
-	/* Donate memory for the vcpu state at hyp and initialize it. */
-	vcpu_state_sz = PAGE_ALIGN(SHADOW_VCPU_STATE_SIZE);
-	kvm_for_each_vcpu (idx, vcpu, kvm) {
-		void *vcpu_state;
+	/* Donate memory for the vcpus at hyp and initialize it. */
+	hyp_vcpu_sz = PAGE_ALIGN(PKVM_HYP_VCPU_SIZE);
+	kvm_for_each_vcpu(idx, host_vcpu, host_kvm) {
+		void *hyp_vcpu;
 
 		/* Indexing of the vcpus to be sequential starting at 0. */
-		if (WARN_ON(vcpu->vcpu_idx != idx)) {
+		if (WARN_ON(host_vcpu->vcpu_idx != idx)) {
 			ret = -EINVAL;
 			goto destroy_vm;
 		}
-		vcpu_state = alloc_pages_exact(vcpu_state_sz, GFP_KERNEL_ACCOUNT);
-		if (!vcpu_state) {
+
+		hyp_vcpu = alloc_pages_exact(hyp_vcpu_sz, GFP_KERNEL_ACCOUNT);
+		if (!hyp_vcpu) {
 			ret = -ENOMEM;
 			goto destroy_vm;
 		}
 
-		ret = kvm_call_hyp_nvhe(__pkvm_init_shadow_vcpu, shadow_handle,
-					vcpu, vcpu_state);
+		ret = kvm_call_hyp_nvhe(__pkvm_init_vcpu, handle, host_vcpu,
+					hyp_vcpu);
 		if (ret) {
-			free_pages_exact(vcpu_state, vcpu_state_sz);
+			free_pages_exact(hyp_vcpu, hyp_vcpu_sz);
 			goto destroy_vm;
 		}
 	}
@@ -184,169 +181,83 @@ static int __create_el2_shadow(struct kvm *kvm)
 	return 0;
 
 destroy_vm:
-	kvm_shadow_destroy(kvm);
+	pkvm_destroy_hyp_vm(host_kvm);
 	return ret;
-free_shadow:
-	free_pages_exact(shadow_addr, shadow_sz);
+free_vm:
+	free_pages_exact(hyp_vm, hyp_vm_sz);
 free_pgd:
 	free_pages_exact(pgd, pgd_sz);
 	return ret;
 }
 
-int create_el2_shadow(struct kvm *kvm)
+int pkvm_create_hyp_vm(struct kvm *host_kvm)
 {
 	int ret = 0;
 
-	mutex_lock(&kvm->arch.pkvm.shadow_lock);
-	if (!kvm->arch.pkvm.shadow_handle)
-		ret = __create_el2_shadow(kvm);
-	mutex_unlock(&kvm->arch.pkvm.shadow_lock);
+	mutex_lock(&host_kvm->lock);
+	if (!host_kvm->arch.pkvm.handle)
+		ret = __pkvm_create_hyp_vm(host_kvm);
+	mutex_unlock(&host_kvm->lock);
 
 	return ret;
 }
 
-void kvm_shadow_destroy(struct kvm *kvm)
+void pkvm_destroy_hyp_vm(struct kvm *host_kvm)
 {
-	struct kvm_pinned_page *ppage, *tmp;
-	struct mm_struct *mm = current->mm;
-	struct list_head *ppages;
-
-	if (kvm->arch.pkvm.shadow_handle)
-		WARN_ON(kvm_call_hyp_nvhe(__pkvm_teardown_shadow,
-					  kvm->arch.pkvm.shadow_handle));
-
-	free_hyp_memcache(&kvm->arch.pkvm.teardown_mc);
-
-	ppages = &kvm->arch.pkvm.pinned_pages;
-	list_for_each_entry_safe(ppage, tmp, ppages, link) {
-		WARN_ON(kvm_call_hyp_nvhe(__pkvm_host_reclaim_page,
-					  page_to_pfn(ppage->page)));
-		cond_resched();
-
-		account_locked_vm(mm, 1, false);
-		unpin_user_pages_dirty_lock(&ppage->page, 1, true);
-		list_del(&ppage->link);
-		kfree(ppage);
+	if (host_kvm->arch.pkvm.handle) {
+		WARN_ON(kvm_call_hyp_nvhe(__pkvm_teardown_vm,
+					  host_kvm->arch.pkvm.handle));
 	}
+
+	host_kvm->arch.pkvm.handle = 0;
+	free_hyp_memcache(&host_kvm->arch.pkvm.teardown_mc);
 }
 
-static int __init pkvm_firmware_rmem_err(struct reserved_mem *rmem,
-					 const char *reason)
+int pkvm_init_host_vm(struct kvm *host_kvm)
 {
-	phys_addr_t end = rmem->base + rmem->size;
-
-	kvm_err("Ignoring pkvm guest firmware memory reservation [%pa - %pa]: %s\n",
-		&rmem->base, &end, reason);
-	return -EINVAL;
-}
-
-static int __init pkvm_firmware_rmem_init(struct reserved_mem *rmem)
-{
-	unsigned long node = rmem->fdt_node;
-
-	if (pkvm_firmware_mem)
-		return pkvm_firmware_rmem_err(rmem, "duplicate reservation");
-
-	if (!of_get_flat_dt_prop(node, "no-map", NULL))
-		return pkvm_firmware_rmem_err(rmem, "missing \"no-map\" property");
-
-	if (of_get_flat_dt_prop(node, "reusable", NULL))
-		return pkvm_firmware_rmem_err(rmem, "\"reusable\" property unsupported");
-
-	if (!PAGE_ALIGNED(rmem->base))
-		return pkvm_firmware_rmem_err(rmem, "base is not page-aligned");
-
-	if (!PAGE_ALIGNED(rmem->size))
-		return pkvm_firmware_rmem_err(rmem, "size is not page-aligned");
-
-	*pvmfw_size = rmem->size;
-	*pvmfw_base = rmem->base;
-	pkvm_firmware_mem = rmem;
+	mutex_init(&host_kvm->lock);
 	return 0;
 }
-RESERVEDMEM_OF_DECLARE(pkvm_firmware, "linux,pkvm-guest-firmware-memory",
-		       pkvm_firmware_rmem_init);
 
-static int __init pkvm_firmware_rmem_clear(void)
+static void __init _kvm_host_prot_finalize(void *arg)
 {
-	void *addr;
-	phys_addr_t size;
+	int *err = arg;
 
-	if (likely(!pkvm_firmware_mem) || is_protected_kvm_enabled())
-		return 0;
-
-	kvm_info("Clearing unused pKVM firmware memory\n");
-	size = pkvm_firmware_mem->size;
-	addr = memremap(pkvm_firmware_mem->base, size, MEMREMAP_WB);
-	if (!addr)
-		return -EINVAL;
-
-	memset(addr, 0, size);
-	dcache_clean_poc((unsigned long)addr, (unsigned long)addr + size);
-	memunmap(addr);
-	return 0;
+	if (WARN_ON(kvm_call_hyp_nvhe(__pkvm_prot_finalize)))
+		WRITE_ONCE(*err, -EINVAL);
 }
-device_initcall_sync(pkvm_firmware_rmem_clear);
 
-static int pkvm_vm_ioctl_set_fw_ipa(struct kvm *kvm, u64 ipa)
+static int __init pkvm_drop_host_privileges(void)
 {
 	int ret = 0;
 
-	if (!pkvm_firmware_mem)
-		return -EINVAL;
-
-	mutex_lock(&kvm->arch.pkvm.shadow_lock);
-	if (kvm->arch.pkvm.shadow_handle) {
-		ret = -EBUSY;
-		goto out_unlock;
-	}
-
-	kvm->arch.pkvm.pvmfw_load_addr = ipa;
-out_unlock:
-	mutex_unlock(&kvm->arch.pkvm.shadow_lock);
+	/*
+	 * Flip the static key upfront as that may no longer be possible
+	 * once the host stage 2 is installed.
+	 */
+	static_branch_enable(&kvm_protected_mode_initialized);
+	on_each_cpu(_kvm_host_prot_finalize, &ret, 1);
 	return ret;
 }
 
-static int pkvm_vm_ioctl_info(struct kvm *kvm,
-			      struct kvm_protected_vm_info __user *info)
+static int __init finalize_pkvm(void)
 {
-	struct kvm_protected_vm_info kinfo = {
-		.firmware_size = pkvm_firmware_mem ?
-				 pkvm_firmware_mem->size :
-				 0,
-	};
+	int ret;
 
-	return copy_to_user(info, &kinfo, sizeof(kinfo)) ? -EFAULT : 0;
-}
-
-int kvm_arm_vm_ioctl_pkvm(struct kvm *kvm, struct kvm_enable_cap *cap)
-{
-	if (cap->args[1] || cap->args[2] || cap->args[3])
-		return -EINVAL;
-
-	switch (cap->flags) {
-	case KVM_CAP_ARM_PROTECTED_VM_FLAGS_SET_FW_IPA:
-		return pkvm_vm_ioctl_set_fw_ipa(kvm, cap->args[0]);
-	case KVM_CAP_ARM_PROTECTED_VM_FLAGS_INFO:
-		return pkvm_vm_ioctl_info(kvm, (void __force __user *)cap->args[0]);
-	default:
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-int kvm_init_pvm(struct kvm *kvm, unsigned long type)
-{
-	mutex_init(&kvm->arch.pkvm.shadow_lock);
-	kvm->arch.pkvm.pvmfw_load_addr = PVMFW_INVALID_LOAD_ADDR;
-
-	if (!(type & KVM_VM_TYPE_ARM_PROTECTED))
+	if (!is_protected_kvm_enabled() || !is_kvm_arm_initialised())
 		return 0;
 
-	if (!is_protected_kvm_enabled())
-		return -EINVAL;
+	/*
+	 * Exclude HYP sections from kmemleak so that they don't get peeked
+	 * at, which would end badly once inaccessible.
+	 */
+	kmemleak_free_part(__hyp_bss_start, __hyp_bss_end - __hyp_bss_start);
+	kmemleak_free_part_phys(hyp_mem_base, hyp_mem_size);
 
-	kvm->arch.pkvm.enabled = true;
-	return 0;
+	ret = pkvm_drop_host_privileges();
+	if (ret)
+		pr_err("Failed to finalize Hyp protection: %d\n", ret);
+
+	return ret;
 }
+device_initcall_sync(finalize_pkvm);

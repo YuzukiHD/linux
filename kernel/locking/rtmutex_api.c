@@ -21,17 +21,16 @@ int max_lock_depth = 1024;
  */
 static __always_inline int __rt_mutex_lock_common(struct rt_mutex *lock,
 						  unsigned int state,
+						  struct lockdep_map *nest_lock,
 						  unsigned int subclass)
 {
 	int ret;
 
 	might_sleep();
-	mutex_acquire(&lock->dep_map, subclass, 0, _RET_IP_);
+	mutex_acquire_nest(&lock->dep_map, subclass, 0, nest_lock, _RET_IP_);
 	ret = __rt_mutex_lock(&lock->rtmutex, state);
 	if (ret)
 		mutex_release(&lock->dep_map, _RET_IP_);
-	else
-		trace_android_vh_record_rtmutex_lock_starttime(current, jiffies);
 	return ret;
 }
 
@@ -50,9 +49,15 @@ EXPORT_SYMBOL(rt_mutex_base_init);
  */
 void __sched rt_mutex_lock_nested(struct rt_mutex *lock, unsigned int subclass)
 {
-	__rt_mutex_lock_common(lock, TASK_UNINTERRUPTIBLE, subclass);
+	__rt_mutex_lock_common(lock, TASK_UNINTERRUPTIBLE, NULL, subclass);
 }
 EXPORT_SYMBOL_GPL(rt_mutex_lock_nested);
+
+void __sched _rt_mutex_lock_nest_lock(struct rt_mutex *lock, struct lockdep_map *nest_lock)
+{
+	__rt_mutex_lock_common(lock, TASK_UNINTERRUPTIBLE, nest_lock, 0);
+}
+EXPORT_SYMBOL_GPL(_rt_mutex_lock_nest_lock);
 
 #else /* !CONFIG_DEBUG_LOCK_ALLOC */
 
@@ -63,7 +68,7 @@ EXPORT_SYMBOL_GPL(rt_mutex_lock_nested);
  */
 void __sched rt_mutex_lock(struct rt_mutex *lock)
 {
-	__rt_mutex_lock_common(lock, TASK_UNINTERRUPTIBLE, 0);
+	__rt_mutex_lock_common(lock, TASK_UNINTERRUPTIBLE, NULL, 0);
 }
 EXPORT_SYMBOL_GPL(rt_mutex_lock);
 #endif
@@ -79,9 +84,24 @@ EXPORT_SYMBOL_GPL(rt_mutex_lock);
  */
 int __sched rt_mutex_lock_interruptible(struct rt_mutex *lock)
 {
-	return __rt_mutex_lock_common(lock, TASK_INTERRUPTIBLE, 0);
+	return __rt_mutex_lock_common(lock, TASK_INTERRUPTIBLE, NULL, 0);
 }
 EXPORT_SYMBOL_GPL(rt_mutex_lock_interruptible);
+
+/**
+ * rt_mutex_lock_killable - lock a rt_mutex killable
+ *
+ * @lock:		the rt_mutex to be locked
+ *
+ * Returns:
+ *  0		on success
+ * -EINTR	when interrupted by a signal
+ */
+int __sched rt_mutex_lock_killable(struct rt_mutex *lock)
+{
+	return __rt_mutex_lock_common(lock, TASK_KILLABLE, NULL, 0);
+}
+EXPORT_SYMBOL_GPL(rt_mutex_lock_killable);
 
 /**
  * rt_mutex_trylock - try to lock a rt_mutex
@@ -103,10 +123,8 @@ int __sched rt_mutex_trylock(struct rt_mutex *lock)
 		return 0;
 
 	ret = __rt_mutex_trylock(&lock->rtmutex);
-	if (ret) {
-		trace_android_vh_record_rtmutex_lock_starttime(current, jiffies);
+	if (ret)
 		mutex_acquire(&lock->dep_map, 0, 1, _RET_IP_);
-	}
 
 	return ret;
 }
@@ -119,7 +137,6 @@ EXPORT_SYMBOL_GPL(rt_mutex_trylock);
  */
 void __sched rt_mutex_unlock(struct rt_mutex *lock)
 {
-	trace_android_vh_record_rtmutex_lock_starttime(current, 0);
 	mutex_release(&lock->dep_map, _RET_IP_);
 	__rt_mutex_unlock(&lock->rtmutex);
 }
@@ -442,7 +459,7 @@ void __sched rt_mutex_adjust_pi(struct task_struct *task)
 	raw_spin_lock_irqsave(&task->pi_lock, flags);
 
 	waiter = task->pi_blocked_on;
-	if (!waiter || rt_mutex_waiter_equal(waiter, task_to_waiter(task))) {
+	if (!waiter || rt_waiter_node_equal(&waiter->tree, task_to_waiter_node(task))) {
 		raw_spin_unlock_irqrestore(&task->pi_lock, flags);
 		return;
 	}

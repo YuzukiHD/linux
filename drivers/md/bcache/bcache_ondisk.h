@@ -43,9 +43,9 @@ static inline void SET_##name(struct bkey *k, unsigned int i, __u64 v)	\
 #define KEY_MAX_U64S		8
 
 KEY_FIELD(KEY_PTRS,	high, 60, 3)
-KEY_FIELD(HEADER_SIZE,	high, 58, 2)
+KEY_FIELD(__PAD0,	high, 58, 2)
 KEY_FIELD(KEY_CSUM,	high, 56, 2)
-KEY_FIELD(KEY_PINNED,	high, 55, 1)
+KEY_FIELD(__PAD1,	high, 55, 1)
 KEY_FIELD(KEY_DIRTY,	high, 36, 1)
 
 KEY_FIELD(KEY_SIZE,	high, 20, KEY_SIZE_BITS)
@@ -106,7 +106,8 @@ static inline unsigned long bkey_bytes(const struct bkey *k)
 	return bkey_u64s(k) * sizeof(__u64);
 }
 
-#define bkey_copy(_dest, _src)	memcpy(_dest, _src, bkey_bytes(_src))
+#define bkey_copy(_dest, _src)	unsafe_memcpy(_dest, _src, bkey_bytes(_src), \
+					/* bkey is always padded */)
 
 static inline void bkey_copy_key(struct bkey *dest, const struct bkey *src)
 {
@@ -359,8 +360,8 @@ struct jset {
 	__u64			prio_bucket[MAX_CACHES_PER_SET];
 
 	union {
-		struct bkey	start[0];
-		__u64		d[0];
+		DECLARE_FLEX_ARRAY(struct bkey, start);
+		DECLARE_FLEX_ARRAY(__u64, d);
 	};
 };
 
@@ -424,8 +425,8 @@ struct bset {
 	__u32			keys;
 
 	union {
-		struct bkey	start[0];
-		__u64		d[0];
+		DECLARE_FLEX_ARRAY(struct bkey, start);
+		DECLARE_FLEX_ARRAY(__u64, d);
 	};
 };
 

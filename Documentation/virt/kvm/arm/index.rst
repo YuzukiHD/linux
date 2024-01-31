@@ -8,7 +8,6 @@ ARM
    :maxdepth: 2
 
    hyp-abi
-   psci
+   hypercalls
    pvtime
    ptp_kvm
-   mmio-guard

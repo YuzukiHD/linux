@@ -228,8 +228,11 @@ static int mmc_err_state_get(void *data, u64 *val)
 	struct mmc_host *host = data;
 	int i;
 
+	if (!host)
+		return -EINVAL;
+
 	*val = 0;
-	for (i = 0; i < ARRAY_SIZE(host->err_stats); i++) {
+	for (i = 0; i < MMC_ERR_MAX; i++) {
 		if (host->err_stats[i]) {
 			*val = 1;
 			break;
@@ -243,8 +246,8 @@ DEFINE_DEBUGFS_ATTRIBUTE(mmc_err_state, mmc_err_state_get, NULL, "%llu\n");
 
 static int mmc_err_stats_show(struct seq_file *file, void *data)
 {
-	struct mmc_host *host = (struct mmc_host *)file->private;
-	static const char *desc[MMC_ERR_MAX] = {
+	struct mmc_host *host = file->private;
+	const char *desc[MMC_ERR_MAX] = {
 		[MMC_ERR_CMD_TIMEOUT] = "Command Timeout Occurred",
 		[MMC_ERR_CMD_CRC] = "Command CRC Errors Occurred",
 		[MMC_ERR_DAT_TIMEOUT] = "Data Timeout Occurred",
@@ -263,7 +266,7 @@ static int mmc_err_stats_show(struct seq_file *file, void *data)
 	};
 	int i;
 
-	for (i = 0; i < ARRAY_SIZE(desc); i++) {
+	for (i = 0; i < MMC_ERR_MAX; i++) {
 		if (desc[i])
 			seq_printf(file, "# %s:\t %d\n",
 					desc[i], host->err_stats[i]);
@@ -292,6 +295,7 @@ static const struct file_operations mmc_err_stats_fops = {
 	.open	= mmc_err_stats_open,
 	.read	= seq_read,
 	.write	= mmc_err_stats_write,
+	.release = single_release,
 };
 
 void mmc_add_host_debugfs(struct mmc_host *host)
@@ -307,7 +311,7 @@ void mmc_add_host_debugfs(struct mmc_host *host)
 	debugfs_create_file_unsafe("clock", S_IRUSR | S_IWUSR, root, host,
 				   &mmc_clock_fops);
 
-	debugfs_create_file("err_state", 0600, root, host,
+	debugfs_create_file_unsafe("err_state", 0600, root, host,
 			    &mmc_err_state);
 	debugfs_create_file("err_stats", 0600, root, host,
 			    &mmc_err_stats_fops);

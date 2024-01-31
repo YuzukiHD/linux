@@ -9,13 +9,22 @@
 #include <linux/compat.h>
 #include <linux/fileattr.h>
 
-static ssize_t fuse_send_ioctl(struct fuse_mount *fm, struct fuse_args *args)
+static ssize_t fuse_send_ioctl(struct fuse_mount *fm, struct fuse_args *args,
+			       struct fuse_ioctl_out *outarg)
 {
-	ssize_t ret = fuse_simple_request(fm, args);
+	ssize_t ret;
+
+	args->out_args[0].size = sizeof(*outarg);
+	args->out_args[0].value = outarg;
+
+	ret = fuse_simple_request(fm, args);
 
 	/* Translate ENOSYS, which shouldn't be returned from fs */
 	if (ret == -ENOSYS)
 		ret = -ENOTTY;
+
+	if (ret >= 0 && outarg->result == -ENOSYS)
+		outarg->result = -ENOTTY;
 
 	return ret;
 }
@@ -181,7 +190,7 @@ long fuse_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
 #else
 	if (flags & FUSE_IOCTL_COMPAT) {
 		inarg.flags |= FUSE_IOCTL_32BIT;
-#ifdef CONFIG_X86_X32
+#ifdef CONFIG_X86_X32_ABI
 		if (in_x32_syscall())
 			inarg.flags |= FUSE_IOCTL_COMPAT_X32;
 #endif
@@ -255,7 +264,7 @@ long fuse_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
 		ap.args.in_pages = true;
 
 		err = -EFAULT;
-		iov_iter_init(&ii, WRITE, in_iov, in_iovs, in_size);
+		iov_iter_init(&ii, ITER_SOURCE, in_iov, in_iovs, in_size);
 		for (i = 0; iov_iter_count(&ii) && !WARN_ON(i >= ap.num_pages); i++) {
 			c = copy_page_from_iter(ap.pages[i], 0, PAGE_SIZE, &ii);
 			if (c != PAGE_SIZE && iov_iter_count(&ii))
@@ -264,13 +273,11 @@ long fuse_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
 	}
 
 	ap.args.out_numargs = 2;
-	ap.args.out_args[0].size = sizeof(outarg);
-	ap.args.out_args[0].value = &outarg;
 	ap.args.out_args[1].size = out_size;
 	ap.args.out_pages = true;
 	ap.args.out_argvar = true;
 
-	transferred = fuse_send_ioctl(fm, &ap.args);
+	transferred = fuse_send_ioctl(fm, &ap.args, &outarg);
 	err = transferred;
 	if (transferred < 0)
 		goto out;
@@ -297,11 +304,11 @@ long fuse_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
 		    in_iovs + out_iovs > FUSE_IOCTL_MAX_IOV)
 			goto out;
 
-		vaddr = kmap_atomic(ap.pages[0]);
+		vaddr = kmap_local_page(ap.pages[0]);
 		err = fuse_copy_ioctl_iovec(fm->fc, iov_page, vaddr,
 					    transferred, in_iovs + out_iovs,
 					    (flags & FUSE_IOCTL_COMPAT) != 0);
-		kunmap_atomic(vaddr);
+		kunmap_local(vaddr);
 		if (err)
 			goto out;
 
@@ -324,7 +331,7 @@ long fuse_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
 		goto out;
 
 	err = -EFAULT;
-	iov_iter_init(&ii, READ, out_iov, out_iovs, transferred);
+	iov_iter_init(&ii, ITER_DEST, out_iov, out_iovs, transferred);
 	for (i = 0; iov_iter_count(&ii) && !WARN_ON(i >= ap.num_pages); i++) {
 		c = copy_page_to_iter(ap.pages[i], 0, PAGE_SIZE, &ii);
 		if (c != PAGE_SIZE && iov_iter_count(&ii))
@@ -353,15 +360,6 @@ long fuse_ioctl_common(struct file *file, unsigned int cmd,
 	if (fuse_is_bad(inode))
 		return -EIO;
 
-#ifdef CONFIG_FUSE_BPF
-	{
-		struct fuse_file *ff = file->private_data;
-
-		/* TODO - this is simply passthrough, not a proper BPF filter */
-		if (ff->backing_file)
-			return fuse_backing_ioctl(file, cmd, arg, flags);
-	}
-#endif
 	return fuse_do_ioctl(file, cmd, arg, flags);
 }
 
@@ -408,12 +406,10 @@ static int fuse_priv_ioctl(struct inode *inode, struct fuse_file *ff,
 	args.in_args[1].size = inarg.in_size;
 	args.in_args[1].value = ptr;
 	args.out_numargs = 2;
-	args.out_args[0].size = sizeof(outarg);
-	args.out_args[0].value = &outarg;
 	args.out_args[1].size = inarg.out_size;
 	args.out_args[1].value = ptr;
 
-	err = fuse_send_ioctl(fm, &args);
+	err = fuse_send_ioctl(fm, &args, &outarg);
 	if (!err) {
 		if (outarg.result < 0)
 			err = outarg.result;
@@ -482,7 +478,7 @@ cleanup:
 	return err;
 }
 
-int fuse_fileattr_set(struct user_namespace *mnt_userns,
+int fuse_fileattr_set(struct mnt_idmap *idmap,
 		      struct dentry *dentry, struct fileattr *fa)
 {
 	struct inode *inode = d_inode(dentry);

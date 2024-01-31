@@ -20,8 +20,6 @@ static bool fuse_use_readdirplus(struct inode *dir, struct dir_context *ctx)
 
 	if (!fc->do_readdirplus)
 		return false;
-	if (fi->nodeid == 0)
-		return false;
 	if (!fc->readdirplus_auto)
 		return true;
 	if (test_and_clear_bit(FUSE_I_ADVISE_RDPLUS, &fi->state))
@@ -78,13 +76,13 @@ static void fuse_add_dirent_to_cache(struct file *file,
 	    WARN_ON(fi->rdc.pos != pos))
 		goto unlock;
 
-	addr = kmap_atomic(page);
+	addr = kmap_local_page(page);
 	if (!offset) {
 		clear_page(addr);
 		SetPageUptodate(page);
 	}
 	memcpy(addr + offset, dirent, reclen);
-	kunmap_atomic(addr);
+	kunmap_local(addr);
 	fi->rdc.size = (index << PAGE_SHIFT) + offset + reclen;
 	fi->rdc.pos = dirent->off;
 unlock:
@@ -225,8 +223,8 @@ retry:
 		spin_unlock(&fi->lock);
 
 		forget_all_cached_acls(inode);
-		fuse_change_attributes(inode, &o->attr,
-				       entry_attr_timeout(o),
+		fuse_change_attributes(inode, &o->attr, NULL,
+				       ATTR_TIMEOUT(o),
 				       attr_version);
 		/*
 		 * The other branch comes via fuse_iget()
@@ -234,7 +232,7 @@ retry:
 		 */
 	} else {
 		inode = fuse_iget(dir->i_sb, o->nodeid, o->generation,
-				  &o->attr, entry_attr_timeout(o),
+				  &o->attr, ATTR_TIMEOUT(o),
 				  attr_version);
 		if (!inode)
 			inode = ERR_PTR(-ENOMEM);
@@ -245,8 +243,16 @@ retry:
 			dput(dentry);
 			dentry = alias;
 		}
-		if (IS_ERR(dentry))
+		if (IS_ERR(dentry)) {
+			if (!IS_ERR(inode)) {
+				struct fuse_inode *fi = get_fuse_inode(inode);
+
+				spin_lock(&fi->lock);
+				fi->nlookup--;
+				spin_unlock(&fi->lock);
+			}
 			return PTR_ERR(dentry);
+		}
 	}
 	if (fc->readdirplus_auto)
 		set_bit(FUSE_I_INIT_RDPLUS, &get_fuse_inode(inode)->state);
@@ -458,7 +464,7 @@ static int fuse_readdir_cached(struct file *file, struct dir_context *ctx)
 	 * cache; both cases require an up-to-date mtime value.
 	 */
 	if (!ctx->pos && fc->auto_inval_data) {
-		int err = fuse_update_attributes(inode, file);
+		int err = fuse_update_attributes(inode, file, STATX_MTIME);
 
 		if (err)
 			return err;
@@ -549,9 +555,9 @@ retry_locked:
 	 * Contents of the page are now protected against changing by holding
 	 * the page lock.
 	 */
-	addr = kmap(page);
+	addr = kmap_local_page(page);
 	res = fuse_parse_cache(ff, addr, size, ctx);
-	kunmap(page);
+	kunmap_local(addr);
 	unlock_page(page);
 	put_page(page);
 
@@ -580,26 +586,6 @@ int fuse_readdir(struct file *file, struct dir_context *ctx)
 	struct fuse_file *ff = file->private_data;
 	struct inode *inode = file_inode(file);
 	int err;
-
-#ifdef CONFIG_FUSE_BPF
-	struct fuse_err_ret fer;
-	bool allow_force;
-	bool force_again = false;
-	bool is_continued = false;
-
-again:
-	fer = fuse_bpf_backing(inode, struct fuse_read_io,
-			       fuse_readdir_initialize, fuse_readdir_backing,
-			       fuse_readdir_finalize,
-			       file, ctx, &force_again, &allow_force, is_continued);
-	if (force_again && !IS_ERR(fer.result)) {
-		is_continued = true;
-		goto again;
-	}
-
-	if (fer.ret)
-		return PTR_ERR(fer.result);
-#endif
 
 	if (fuse_is_bad(inode))
 		return -EIO;

@@ -52,6 +52,8 @@ static DEFINE_IDA(rpmsg_minor_ida);
  * @readq:	wait object for incoming queue
  * @default_ept: set to channel default endpoint if the default endpoint should be re-used
  *              on device open to prevent endpoint address update.
+ * remote_flow_restricted: to indicate if the remote has requested for flow to be limited
+ * remote_flow_updated: to indicate if the flow control has been requested
  */
 struct rpmsg_eptdev {
 	struct device dev;
@@ -68,6 +70,8 @@ struct rpmsg_eptdev {
 	struct sk_buff_head queue;
 	wait_queue_head_t readq;
 
+	bool remote_flow_restricted;
+	bool remote_flow_updated;
 };
 
 int rpmsg_chrdev_eptdev_destroy(struct device *dev, void *data)
@@ -75,6 +79,7 @@ int rpmsg_chrdev_eptdev_destroy(struct device *dev, void *data)
 	struct rpmsg_eptdev *eptdev = dev_to_eptdev(dev);
 
 	mutex_lock(&eptdev->ept_lock);
+	eptdev->rpdev = NULL;
 	if (eptdev->ept) {
 		/* The default endpoint is released by the rpmsg core */
 		if (!eptdev->default_ept)
@@ -93,8 +98,8 @@ int rpmsg_chrdev_eptdev_destroy(struct device *dev, void *data)
 }
 EXPORT_SYMBOL(rpmsg_chrdev_eptdev_destroy);
 
-static int rpmsg_ept_copy_cb(struct rpmsg_device *rpdev, void *buf, int len,
-			     void *priv, u32 addr)
+static int rpmsg_ept_cb(struct rpmsg_device *rpdev, void *buf, int len,
+			void *priv, u32 addr)
 {
 	struct rpmsg_eptdev *eptdev = priv;
 	struct sk_buff *skb;
@@ -115,41 +120,16 @@ static int rpmsg_ept_copy_cb(struct rpmsg_device *rpdev, void *buf, int len,
 	return 0;
 }
 
-static int rpmsg_ept_no_copy_cb(struct rpmsg_device *rpdev, void *buf, int len,
-				void *priv, u32 addr)
+static int rpmsg_ept_flow_cb(struct rpmsg_device *rpdev, void *priv, bool enable)
 {
 	struct rpmsg_eptdev *eptdev = priv;
-	struct sk_buff *skb;
 
-	skb = alloc_skb(0, GFP_ATOMIC);
-	if (!skb)
-		return -ENOMEM;
+	eptdev->remote_flow_restricted = enable;
+	eptdev->remote_flow_updated = true;
 
-	skb->head = buf;
-	skb->data = buf;
-	skb_reset_tail_pointer(skb);
-	skb_set_end_offset(skb, len);
-	skb_put(skb, len);
-
-	spin_lock(&eptdev->queue_lock);
-	skb_queue_tail(&eptdev->queue, skb);
-	spin_unlock(&eptdev->queue_lock);
-
-	/* wake up any blocking processes, waiting for new data */
 	wake_up_interruptible(&eptdev->readq);
 
-	return RPMSG_DEFER;
-}
-
-static int rpmsg_ept_cb(struct rpmsg_device *rpdev, void *buf, int len,
-			void *priv, u32 addr)
-{
-	struct rpmsg_eptdev *eptdev = priv;
-	rpmsg_rx_cb_t cb;
-
-	cb = (eptdev->ept->rx_done) ? rpmsg_ept_no_copy_cb : rpmsg_ept_copy_cb;
-
-	return cb(rpdev, buf, len, priv, addr);
+	return 0;
 }
 
 static int rpmsg_eptdev_open(struct inode *inode, struct file *filp)
@@ -163,6 +143,11 @@ static int rpmsg_eptdev_open(struct inode *inode, struct file *filp)
 	if (eptdev->ept) {
 		mutex_unlock(&eptdev->ept_lock);
 		return -EBUSY;
+	}
+
+	if (!eptdev->rpdev) {
+		mutex_unlock(&eptdev->ept_lock);
+		return -ENETRESET;
 	}
 
 	get_device(dev);
@@ -183,6 +168,7 @@ static int rpmsg_eptdev_open(struct inode *inode, struct file *filp)
 		return -EINVAL;
 	}
 
+	ept->flow_cb = rpmsg_ept_flow_cb;
 	eptdev->ept = ept;
 	filp->private_data = eptdev;
 	mutex_unlock(&eptdev->ept_lock);
@@ -203,6 +189,7 @@ static int rpmsg_eptdev_release(struct inode *inode, struct file *filp)
 		eptdev->ept = NULL;
 	}
 	mutex_unlock(&eptdev->ept_lock);
+	eptdev->remote_flow_updated = false;
 
 	/* Discard all SKBs */
 	skb_queue_purge(&eptdev->queue);
@@ -254,15 +241,6 @@ static ssize_t rpmsg_eptdev_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	if (copy_to_iter(skb->data, use, to) != use)
 		use = -EFAULT;
 
-	if (eptdev->ept->rx_done) {
-		rpmsg_rx_done(eptdev->ept, skb->data);
-		/*
-		 * Data memory is freed by rpmsg_rx_done(), reset the skb data
-		 * pointers so kfree_skb() does not try to free a second time.
-		 */
-		skb->head = NULL;
-		skb->data = NULL;
-	}
 	kfree_skb(skb);
 
 	return use;
@@ -296,10 +274,13 @@ static ssize_t rpmsg_eptdev_write_iter(struct kiocb *iocb,
 		goto unlock_eptdev;
 	}
 
-	if (filp->f_flags & O_NONBLOCK)
+	if (filp->f_flags & O_NONBLOCK) {
 		ret = rpmsg_trysendto(eptdev->ept, kbuf, len, eptdev->chinfo.dst);
-	else
+		if (ret == -ENOMEM)
+			ret = -EAGAIN;
+	} else {
 		ret = rpmsg_sendto(eptdev->ept, kbuf, len, eptdev->chinfo.dst);
+	}
 
 unlock_eptdev:
 	mutex_unlock(&eptdev->ept_lock);
@@ -322,7 +303,12 @@ static __poll_t rpmsg_eptdev_poll(struct file *filp, poll_table *wait)
 	if (!skb_queue_empty(&eptdev->queue))
 		mask |= EPOLLIN | EPOLLRDNORM;
 
+	if (eptdev->remote_flow_updated)
+		mask |= EPOLLPRI;
+
+	mutex_lock(&eptdev->ept_lock);
 	mask |= rpmsg_poll(eptdev->ept, filp, wait);
+	mutex_unlock(&eptdev->ept_lock);
 
 	return mask;
 }
@@ -332,14 +318,35 @@ static long rpmsg_eptdev_ioctl(struct file *fp, unsigned int cmd,
 {
 	struct rpmsg_eptdev *eptdev = fp->private_data;
 
-	if (cmd != RPMSG_DESTROY_EPT_IOCTL)
-		return -EINVAL;
+	bool set;
+	int ret;
 
-	/* Don't allow to destroy a default endpoint. */
-	if (eptdev->default_ept)
-		return -EINVAL;
+	switch (cmd) {
+	case RPMSG_GET_OUTGOING_FLOWCONTROL:
+		eptdev->remote_flow_updated = false;
+		ret = put_user(eptdev->remote_flow_restricted, (int __user *)arg);
+		break;
+	case RPMSG_SET_INCOMING_FLOWCONTROL:
+		if (arg > 1) {
+			ret = -EINVAL;
+			break;
+		}
+		set = !!arg;
+		ret = rpmsg_set_flow_control(eptdev->ept, set, eptdev->chinfo.dst);
+		break;
+	case RPMSG_DESTROY_EPT_IOCTL:
+		/* Don't allow to destroy a default endpoint. */
+		if (eptdev->default_ept) {
+			ret = -EINVAL;
+			break;
+		}
+		ret = rpmsg_chrdev_eptdev_destroy(&eptdev->dev, NULL);
+		break;
+	default:
+		ret = -EINVAL;
+	}
 
-	return rpmsg_chrdev_eptdev_destroy(&eptdev->dev, NULL);
+	return ret;
 }
 
 static const struct file_operations rpmsg_eptdev_fops = {
@@ -469,15 +476,12 @@ int rpmsg_chrdev_eptdev_create(struct rpmsg_device *rpdev, struct device *parent
 			       struct rpmsg_channel_info chinfo)
 {
 	struct rpmsg_eptdev *eptdev;
-	int ret;
 
 	eptdev = rpmsg_chrdev_eptdev_alloc(rpdev, parent);
 	if (IS_ERR(eptdev))
 		return PTR_ERR(eptdev);
 
-	ret = rpmsg_chrdev_eptdev_add(eptdev, chinfo);
-
-	return ret;
+	return rpmsg_chrdev_eptdev_add(eptdev, chinfo);
 }
 EXPORT_SYMBOL(rpmsg_chrdev_eptdev_create);
 

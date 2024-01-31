@@ -7,8 +7,6 @@ mainmenu "Linux/$(ARCH) $(KERNELVERSION) Kernel Configuration"
 
 source "scripts/Kconfig.include"
 
-source "bsp/Kconfig"
-
 source "init/Kconfig"
 
 source "kernel/Kconfig.freezer"
@@ -32,6 +30,3 @@ source "lib/Kconfig"
 source "lib/Kconfig.debug"
 
 source "Documentation/Kconfig"
-
-# ANDROID: Set KCONFIG_EXT_PREFIX to decend into an external project.
-source "$(KCONFIG_EXT_PREFIX)Kconfig.ext"

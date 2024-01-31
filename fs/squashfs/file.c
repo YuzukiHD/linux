@@ -445,8 +445,9 @@ static int squashfs_readpage_sparse(struct page *page, int expected)
 	return 0;
 }
 
-static int squashfs_readpage(struct file *file, struct page *page)
+static int squashfs_read_folio(struct file *file, struct folio *folio)
 {
+	struct page *page = &folio->page;
 	struct inode *inode = page->mapping->host;
 	struct squashfs_sb_info *msblk = inode->i_sb->s_fs_info;
 	int index = page->index >> (msblk->block_log - PAGE_SHIFT);
@@ -454,7 +455,7 @@ static int squashfs_readpage(struct file *file, struct page *page)
 	int expected = index == file_end ?
 			(i_size_read(inode) & (msblk->block_size - 1)) :
 			 msblk->block_size;
-	int res;
+	int res = 0;
 	void *pageaddr;
 
 	TRACE("Entered squashfs_readpage, page index %lx, start block %llx\n",
@@ -467,14 +468,15 @@ static int squashfs_readpage(struct file *file, struct page *page)
 	if (index < file_end || squashfs_i(inode)->fragment_block ==
 					SQUASHFS_INVALID_BLK) {
 		u64 block = 0;
-		int bsize = read_blocklist(inode, index, &block);
-		if (bsize < 0)
+
+		res = read_blocklist(inode, index, &block);
+		if (res < 0)
 			goto error_out;
 
-		if (bsize == 0)
+		if (res == 0)
 			res = squashfs_readpage_sparse(page, expected);
 		else
-			res = squashfs_readpage_block(page, block, bsize, expected);
+			res = squashfs_readpage_block(page, block, res, expected);
 	} else
 		res = squashfs_readpage_fragment(page, expected);
 
@@ -488,11 +490,11 @@ out:
 	memset(pageaddr, 0, PAGE_SIZE);
 	kunmap_atomic(pageaddr);
 	flush_dcache_page(page);
-	if (!PageError(page))
+	if (res == 0)
 		SetPageUptodate(page);
 	unlock_page(page);
 
-	return 0;
+	return res;
 }
 
 static int squashfs_readahead_fragment(struct page **page,
@@ -631,6 +633,6 @@ skip_pages:
 }
 
 const struct address_space_operations squashfs_aops = {
-	.readpage = squashfs_readpage,
+	.read_folio = squashfs_read_folio,
 	.readahead = squashfs_readahead
 };

@@ -13,7 +13,7 @@
 #ifndef __DMA_BUF_H__
 #define __DMA_BUF_H__
 
-#include <linux/dma-buf-map.h>
+#include <linux/iosys-map.h>
 #include <linux/file.h>
 #include <linux/err.h>
 #include <linux/scatterlist.h>
@@ -22,8 +22,6 @@
 #include <linux/fs.h>
 #include <linux/dma-fence.h>
 #include <linux/wait.h>
-#include <linux/android_kabi.h>
-#include <linux/workqueue.h>
 
 struct device;
 struct dma_buf;
@@ -88,8 +86,8 @@ struct dma_buf_ops {
 	 * @pin:
 	 *
 	 * This is called by dma_buf_pin() and lets the exporter know that the
-	 * DMA-buf can't be moved any more. The exporter should pin the buffer
-	 * into system memory to make sure it is generally accessible by other
+	 * DMA-buf can't be moved any more. Ideally, the exporter should
+	 * pin the buffer so that it is generally accessible by all
 	 * devices.
 	 *
 	 * This is called with the &dmabuf.resv object locked and is mutual
@@ -232,41 +230,6 @@ struct dma_buf_ops {
 	int (*begin_cpu_access)(struct dma_buf *, enum dma_data_direction);
 
 	/**
-	 * @begin_cpu_access_partial:
-	 *
-	 * This is called from dma_buf_begin_cpu_access_partial() and allows the
-	 * exporter to ensure that the memory specified in the range is
-	 * available for cpu access - the exporter might need to allocate or
-	 * swap-in and pin the backing storage.
-	 * The exporter also needs to ensure that cpu access is
-	 * coherent for the access direction. The direction can be used by the
-	 * exporter to optimize the cache flushing, i.e. access with a different
-	 * direction (read instead of write) might return stale or even bogus
-	 * data (e.g. when the exporter needs to copy the data to temporary
-	 * storage).
-	 *
-	 * This callback is optional.
-	 *
-	 * FIXME: This is both called through the DMA_BUF_IOCTL_SYNC command
-	 * from userspace (where storage shouldn't be pinned to avoid handing
-	 * de-factor mlock rights to userspace) and for the kernel-internal
-	 * users of the various kmap interfaces, where the backing storage must
-	 * be pinned to guarantee that the atomic kmap calls can succeed. Since
-	 * there's no in-kernel users of the kmap interfaces yet this isn't a
-	 * real problem.
-	 *
-	 * Returns:
-	 *
-	 * 0 on success or a negative error code on failure. This can for
-	 * example fail when the backing storage can't be allocated. Can also
-	 * return -ERESTARTSYS or -EINTR when the call has been interrupted and
-	 * needs to be restarted.
-	 */
-	int (*begin_cpu_access_partial)(struct dma_buf *dmabuf,
-					enum dma_data_direction,
-					unsigned int offset, unsigned int len);
-
-	/**
 	 * @end_cpu_access:
 	 *
 	 * This is called from dma_buf_end_cpu_access() when the importer is
@@ -282,28 +245,6 @@ struct dma_buf_ops {
 	 * to be restarted.
 	 */
 	int (*end_cpu_access)(struct dma_buf *, enum dma_data_direction);
-
-	/**
-	 * @end_cpu_access_partial:
-	 *
-	 * This is called from dma_buf_end_cpu_access_partial() when the
-	 * importer is done accessing the CPU. The exporter can use to limit
-	 * cache flushing to only the range specefied and to unpin any
-	 * resources pinned in @begin_cpu_access_umapped.
-	 * The result of any dma_buf kmap calls after end_cpu_access_partial is
-	 * undefined.
-	 *
-	 * This callback is optional.
-	 *
-	 * Returns:
-	 *
-	 * 0 on success or a negative error code on failure. Can return
-	 * -ERESTARTSYS or -EINTR when the call has been interrupted and needs
-	 * to be restarted.
-	 */
-	int (*end_cpu_access_partial)(struct dma_buf *dmabuf,
-				      enum dma_data_direction,
-				      unsigned int offset, unsigned int len);
 
 	/**
 	 * @mmap:
@@ -342,25 +283,8 @@ struct dma_buf_ops {
 	 */
 	int (*mmap)(struct dma_buf *, struct vm_area_struct *vma);
 
-	int (*vmap)(struct dma_buf *dmabuf, struct dma_buf_map *map);
-	void (*vunmap)(struct dma_buf *dmabuf, struct dma_buf_map *map);
-
-	/**
-	 * @get_flags:
-	 *
-	 * This is called by dma_buf_get_flags and is used to get the buffer's
-	 * flags.
-	 * This callback is optional.
-	 *
-	 * Returns:
-	 *
-	 * 0 on success or a negative error code on failure. On success flags
-	 * will be populated with the buffer's flags.
-	 */
-	int (*get_flags)(struct dma_buf *dmabuf, unsigned long *flags);
-
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
+	int (*vmap)(struct dma_buf *dmabuf, struct iosys_map *map);
+	void (*vunmap)(struct dma_buf *dmabuf, struct iosys_map *map);
 };
 
 /**
@@ -403,15 +327,6 @@ struct dma_buf {
 	const struct dma_buf_ops *ops;
 
 	/**
-	 * @lock:
-	 *
-	 * Used internally to serialize list manipulation, attach/detach and
-	 * vmap/unmap. Note that in many cases this is superseeded by
-	 * dma_resv_lock() on @resv.
-	 */
-	struct mutex lock;
-
-	/**
 	 * @vmapping_counter:
 	 *
 	 * Used internally to refcnt the vmaps returned by dma_buf_vmap().
@@ -423,7 +338,7 @@ struct dma_buf {
 	 * @vmap_ptr:
 	 * The current vmap ptr if @vmapping_counter > 0. Protected by @lock.
 	 */
-	struct dma_buf_map vmap_ptr;
+	struct iosys_map vmap_ptr;
 
 	/**
 	 * @exp_name:
@@ -441,7 +356,7 @@ struct dma_buf {
 	 */
 	const char *name;
 
-	/** @name_lock: Spinlock to protect name acces for read access. */
+	/** @name_lock: Spinlock to protect name access for read access. */
 	spinlock_t name_lock;
 
 	/**
@@ -469,41 +384,50 @@ struct dma_buf {
 	 * e.g. exposed in `Implicit Fence Poll Support`_ must follow the
 	 * below rules.
 	 *
-	 * - Drivers must add a shared fence through dma_resv_add_shared_fence()
-	 *   for anything the userspace API considers a read access. This highly
-	 *   depends upon the API and window system.
+	 * - Drivers must add a read fence through dma_resv_add_fence() with the
+	 *   DMA_RESV_USAGE_READ flag for anything the userspace API considers a
+	 *   read access. This highly depends upon the API and window system.
 	 *
-	 * - Similarly drivers must set the exclusive fence through
-	 *   dma_resv_add_excl_fence() for anything the userspace API considers
-	 *   write access.
+	 * - Similarly drivers must add a write fence through
+	 *   dma_resv_add_fence() with the DMA_RESV_USAGE_WRITE flag for
+	 *   anything the userspace API considers write access.
 	 *
-	 * - Drivers may just always set the exclusive fence, since that only
-	 *   causes unecessarily synchronization, but no correctness issues.
+	 * - Drivers may just always add a write fence, since that only
+	 *   causes unnecessary synchronization, but no correctness issues.
 	 *
 	 * - Some drivers only expose a synchronous userspace API with no
 	 *   pipelining across drivers. These do not set any fences for their
 	 *   access. An example here is v4l.
+	 *
+	 * - Driver should use dma_resv_usage_rw() when retrieving fences as
+	 *   dependency for implicit synchronization.
 	 *
 	 * DYNAMIC IMPORTER RULES:
 	 *
 	 * Dynamic importers, see dma_buf_attachment_is_dynamic(), have
 	 * additional constraints on how they set up fences:
 	 *
-	 * - Dynamic importers must obey the exclusive fence and wait for it to
+	 * - Dynamic importers must obey the write fences and wait for them to
 	 *   signal before allowing access to the buffer's underlying storage
 	 *   through the device.
 	 *
 	 * - Dynamic importers should set fences for any access that they can't
 	 *   disable immediately from their &dma_buf_attach_ops.move_notify
 	 *   callback.
+	 *
+	 * IMPORTANT:
+	 *
+	 * All drivers and memory management related functions must obey the
+	 * struct dma_resv rules, specifically the rules for updating and
+	 * obeying fences. See enum dma_resv_usage for further descriptions.
 	 */
 	struct dma_resv *resv;
 
 	/** @poll: for userspace poll support */
 	wait_queue_head_t poll;
 
-	/** @cb_excl: for userspace poll support */
-	/** @cb_shared: for userspace poll support */
+	/** @cb_in: for userspace poll support */
+	/** @cb_out: for userspace poll support */
 	struct dma_buf_poll_cb_t {
 		struct dma_fence_cb cb;
 		wait_queue_head_t *poll;
@@ -518,21 +442,10 @@ struct dma_buf {
 	 * `DMA-BUF statistics`_ for the uapi this enables.
 	 */
 	struct dma_buf_sysfs_entry {
-		union {
-			struct kobject kobj;
-
-			/** @sysfs_add_work:
-			 *
-			 * For deferred sysfs kobject creation using a workqueue.
-			 */
-			struct work_struct sysfs_add_work;
-		};
+		struct kobject kobj;
 		struct dma_buf *dmabuf;
 	} *sysfs_entry;
 #endif
-
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
 };
 
 /**
@@ -568,7 +481,6 @@ struct dma_buf_attach_ops {
 	 * point to the new location of the DMA-buf.
 	 */
 	void (*move_notify)(struct dma_buf_attachment *attach);
-	ANDROID_KABI_RESERVE(1);
 };
 
 /**
@@ -583,8 +495,6 @@ struct dma_buf_attach_ops {
  * @importer_ops: importer operations for this attachment, if provided
  * dma_buf_map/unmap_attachment() must be called with the dma_resv lock held.
  * @importer_priv: importer specific attachment data.
- * @dma_map_attrs: DMA attributes to be used when the exporter maps the buffer
- * through dma_buf_map_attachment.
  *
  * This structure holds the attachment information between the dma_buf buffer
  * and its user device(s). The list contains one attachment struct per device
@@ -605,10 +515,6 @@ struct dma_buf_attachment {
 	const struct dma_buf_attach_ops *importer_ops;
 	void *importer_priv;
 	void *priv;
-	unsigned long dma_map_attrs;
-
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
 };
 
 /**
@@ -632,9 +538,6 @@ struct dma_buf_export_info {
 	int flags;
 	struct dma_resv *resv;
 	void *priv;
-
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
 };
 
 /**
@@ -689,9 +592,6 @@ dma_buf_attachment_is_dynamic(struct dma_buf_attachment *attach)
 	return !!attach->importer_ops;
 }
 
-int get_each_dmabuf(int (*callback)(const struct dma_buf *dmabuf,
-		    void *private), void *private);
-int is_dma_buf_file(struct file *file);
 struct dma_buf_attachment *dma_buf_attach(struct dma_buf *dmabuf,
 					  struct device *dev);
 struct dma_buf_attachment *
@@ -716,19 +616,19 @@ void dma_buf_unmap_attachment(struct dma_buf_attachment *, struct sg_table *,
 void dma_buf_move_notify(struct dma_buf *dma_buf);
 int dma_buf_begin_cpu_access(struct dma_buf *dma_buf,
 			     enum dma_data_direction dir);
-int dma_buf_begin_cpu_access_partial(struct dma_buf *dma_buf,
-				     enum dma_data_direction dir,
-				     unsigned int offset, unsigned int len);
 int dma_buf_end_cpu_access(struct dma_buf *dma_buf,
 			   enum dma_data_direction dir);
-int dma_buf_end_cpu_access_partial(struct dma_buf *dma_buf,
-				     enum dma_data_direction dir,
-				     unsigned int offset, unsigned int len);
+struct sg_table *
+dma_buf_map_attachment_unlocked(struct dma_buf_attachment *attach,
+				enum dma_data_direction direction);
+void dma_buf_unmap_attachment_unlocked(struct dma_buf_attachment *attach,
+				       struct sg_table *sg_table,
+				       enum dma_data_direction direction);
 
 int dma_buf_mmap(struct dma_buf *, struct vm_area_struct *,
 		 unsigned long);
-int dma_buf_vmap(struct dma_buf *dmabuf, struct dma_buf_map *map);
-void dma_buf_vunmap(struct dma_buf *dmabuf, struct dma_buf_map *map);
-long dma_buf_set_name(struct dma_buf *dmabuf, const char *name);
-int dma_buf_get_flags(struct dma_buf *dmabuf, unsigned long *flags);
+int dma_buf_vmap(struct dma_buf *dmabuf, struct iosys_map *map);
+void dma_buf_vunmap(struct dma_buf *dmabuf, struct iosys_map *map);
+int dma_buf_vmap_unlocked(struct dma_buf *dmabuf, struct iosys_map *map);
+void dma_buf_vunmap_unlocked(struct dma_buf *dmabuf, struct iosys_map *map);
 #endif /* __DMA_BUF_H__ */

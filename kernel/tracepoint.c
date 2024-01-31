@@ -571,7 +571,8 @@ static void for_each_tracepoint_range(
 bool trace_module_has_bad_taint(struct module *mod)
 {
 	return mod->taints & ~((1 << TAINT_OOT_MODULE) | (1 << TAINT_CRAP) |
-			       (1 << TAINT_UNSIGNED_MODULE));
+				(1 << TAINT_UNSIGNED_MODULE) | (1 << TAINT_TEST) |
+				(1 << TAINT_LIVEPATCH));
 }
 
 static BLOCKING_NOTIFIER_HEAD(tracepoint_notify_list);
@@ -639,7 +640,6 @@ static void tp_module_going_check_quiescent(struct tracepoint *tp, void *priv)
 static int tracepoint_module_coming(struct module *mod)
 {
 	struct tp_module *tp_mod;
-	int ret = 0;
 
 	if (!mod->num_tracepoints)
 		return 0;
@@ -647,23 +647,22 @@ static int tracepoint_module_coming(struct module *mod)
 	/*
 	 * We skip modules that taint the kernel, especially those with different
 	 * module headers (for forced load), to make sure we don't cause a crash.
-	 * Staging, out-of-tree, and unsigned GPL modules are fine.
+	 * Staging, out-of-tree, unsigned GPL, and test modules are fine.
 	 */
 	if (trace_module_has_bad_taint(mod))
 		return 0;
-	mutex_lock(&tracepoint_module_list_mutex);
+
 	tp_mod = kmalloc(sizeof(struct tp_module), GFP_KERNEL);
-	if (!tp_mod) {
-		ret = -ENOMEM;
-		goto end;
-	}
+	if (!tp_mod)
+		return -ENOMEM;
 	tp_mod->mod = mod;
+
+	mutex_lock(&tracepoint_module_list_mutex);
 	list_add_tail(&tp_mod->list, &tracepoint_module_list);
 	blocking_notifier_call_chain(&tracepoint_notify_list,
 			MODULE_STATE_COMING, tp_mod);
-end:
 	mutex_unlock(&tracepoint_module_list_mutex);
-	return ret;
+	return 0;
 }
 
 static void tracepoint_module_going(struct module *mod)
@@ -785,83 +784,4 @@ void syscall_unregfunc(void)
 		read_unlock(&tasklist_lock);
 	}
 }
-#endif
-
-#ifdef CONFIG_ANDROID_VENDOR_HOOKS
-
-static void *rvh_zalloc_funcs(int count)
-{
-	return kzalloc(sizeof(struct tracepoint_func) * count, GFP_KERNEL);
-}
-
-#define ANDROID_RVH_NR_PROBES_MAX	2
-static int rvh_func_add(struct tracepoint *tp, struct tracepoint_func *func)
-{
-	int i;
-
-	if (!static_key_enabled(&tp->key)) {
-		/* '+ 1' for the last NULL element */
-		tp->funcs = rvh_zalloc_funcs(ANDROID_RVH_NR_PROBES_MAX + 1);
-		if (!tp->funcs)
-			return ENOMEM;
-	}
-
-	for (i = 0; i < ANDROID_RVH_NR_PROBES_MAX; i++) {
-		if (!tp->funcs[i].func) {
-			if (!static_key_enabled(&tp->key))
-				tp->funcs[i].data = func->data;
-			WRITE_ONCE(tp->funcs[i].func, func->func);
-
-			return 0;
-		}
-	}
-
-	return -EBUSY;
-}
-
-static int android_rvh_add_func(struct tracepoint *tp, struct tracepoint_func *func)
-{
-	int ret;
-
-	if (tp->regfunc && !static_key_enabled(&tp->key)) {
-		ret = tp->regfunc();
-		if (ret < 0)
-			return ret;
-	}
-
-	ret = rvh_func_add(tp, func);
-	if (ret)
-		return ret;
-	tracepoint_update_call(tp, tp->funcs);
-	static_key_enable(&tp->key);
-
-	return 0;
-}
-
-int android_rvh_probe_register(struct tracepoint *tp, void *probe, void *data)
-{
-	struct tracepoint_func tp_func;
-	int ret;
-
-	/*
-	 * Once the static key has been flipped, the array may be read
-	 * concurrently. Although __traceiter_*()  always checks .func first,
-	 * it doesn't enforce read->read dependencies, and we can't strongly
-	 * guarantee it will see the correct .data for the second element
-	 * without adding smp_load_acquire() in the fast path. But this is a
-	 * corner case which is unlikely to be needed by anybody in practice,
-	 * so let's just forbid it and keep the fast path clean.
-	 */
-	if (WARN_ON(static_key_enabled(&tp->key) && data))
-		return -EINVAL;
-
-	mutex_lock(&tracepoints_mutex);
-	tp_func.func = probe;
-	tp_func.data = data;
-	ret = android_rvh_add_func(tp, &tp_func);
-	mutex_unlock(&tracepoints_mutex);
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(android_rvh_probe_register);
 #endif

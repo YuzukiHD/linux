@@ -71,7 +71,7 @@ static bool cma_in_zone(gfp_t gfp)
 	end = cma_get_base(cma) + size - 1;
 	if (IS_ENABLED(CONFIG_ZONE_DMA) && (gfp & GFP_DMA))
 		return end <= DMA_BIT_MASK(zone_dma_bits);
-	if (IS_ENABLED(CONFIG_ZONE_DMA32) && (gfp & GFP_DMA32) && !zone_dma32_are_empty())
+	if (IS_ENABLED(CONFIG_ZONE_DMA32) && (gfp & GFP_DMA32))
 		return end <= DMA_BIT_MASK(32);
 	return true;
 }
@@ -84,8 +84,8 @@ static int atomic_pool_expand(struct gen_pool *pool, size_t pool_size,
 	void *addr;
 	int ret = -ENOMEM;
 
-	/* Cannot allocate larger than MAX_ORDER-1 */
-	order = min(get_order(pool_size), MAX_ORDER-1);
+	/* Cannot allocate larger than MAX_ORDER */
+	order = min(get_order(pool_size), MAX_ORDER);
 
 	do {
 		pool_size = 1 << (PAGE_SHIFT + order);
@@ -135,9 +135,9 @@ encrypt_mapping:
 remove_mapping:
 #ifdef CONFIG_DMA_DIRECT_REMAP
 	dma_common_free_remap(addr, pool_size);
-#endif
-free_page: __maybe_unused
+free_page:
 	__free_pages(page, order);
+#endif
 out:
 	return ret;
 }
@@ -153,7 +153,7 @@ static void atomic_pool_work_fn(struct work_struct *work)
 	if (IS_ENABLED(CONFIG_ZONE_DMA))
 		atomic_pool_resize(atomic_pool_dma,
 				   GFP_KERNEL | GFP_DMA);
-	if (IS_ENABLED(CONFIG_ZONE_DMA32) && !zone_dma32_are_empty())
+	if (IS_ENABLED(CONFIG_ZONE_DMA32))
 		atomic_pool_resize(atomic_pool_dma32,
 				   GFP_KERNEL | GFP_DMA32);
 	atomic_pool_resize(atomic_pool_kernel, GFP_KERNEL);
@@ -190,7 +190,7 @@ static int __init dma_atomic_pool_init(void)
 
 	/*
 	 * If coherent_pool was not used on the command line, default the pool
-	 * sizes to 128KB per 1GB of memory, min 128KB, max MAX_ORDER-1.
+	 * sizes to 128KB per 1GB of memory, min 128KB, max MAX_ORDER.
 	 */
 	if (!atomic_pool_size) {
 		unsigned long pages = totalram_pages() / (SZ_1G / SZ_128K);
@@ -209,7 +209,7 @@ static int __init dma_atomic_pool_init(void)
 		if (!atomic_pool_dma)
 			ret = -ENOMEM;
 	}
-	if (IS_ENABLED(CONFIG_ZONE_DMA32) && !zone_dma32_are_empty()) {
+	if (IS_ENABLED(CONFIG_ZONE_DMA32)) {
 		atomic_pool_dma32 = __dma_atomic_pool_init(atomic_pool_size,
 						GFP_KERNEL | GFP_DMA32);
 		if (!atomic_pool_dma32)
@@ -224,7 +224,7 @@ postcore_initcall(dma_atomic_pool_init);
 static inline struct gen_pool *dma_guess_pool(struct gen_pool *prev, gfp_t gfp)
 {
 	if (prev == NULL) {
-		if (IS_ENABLED(CONFIG_ZONE_DMA32) && (gfp & GFP_DMA32) && !zone_dma32_are_empty())
+		if (IS_ENABLED(CONFIG_ZONE_DMA32) && (gfp & GFP_DMA32))
 			return atomic_pool_dma32;
 		if (atomic_pool_dma && (gfp & GFP_DMA))
 			return atomic_pool_dma;

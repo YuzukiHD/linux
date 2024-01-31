@@ -65,6 +65,11 @@ struct elf_prpsinfo
 	__kernel_gid_t	pr_gid;
 	pid_t	pr_pid, pr_ppid, pr_pgrp, pr_sid;
 	/* Lots missing */
+	/*
+	 * The hard-coded 16 is derived from TASK_COMM_LEN, but it can't be
+	 * changed as it is exposed to userspace. We'd better make it hard-coded
+	 * here.
+	 */
 	char	pr_fname[16];	/* filename of executable */
 	char	pr_psargs[ELF_PRARGSZ];	/* initial part of arg list */
 };
@@ -79,35 +84,17 @@ static inline void elf_core_copy_regs(elf_gregset_t *elfregs, struct pt_regs *re
 #endif
 }
 
-static inline void elf_core_copy_kernel_regs(elf_gregset_t *elfregs, struct pt_regs *regs)
-{
-#ifdef ELF_CORE_COPY_KERNEL_REGS
-	ELF_CORE_COPY_KERNEL_REGS((*elfregs), regs);
-#else
-	elf_core_copy_regs(elfregs, regs);
-#endif
-}
-
 static inline int elf_core_copy_task_regs(struct task_struct *t, elf_gregset_t* elfregs)
 {
 #if defined (ELF_CORE_COPY_TASK_REGS)
 	return ELF_CORE_COPY_TASK_REGS(t, elfregs);
-#elif defined (task_pt_regs)
+#else
 	elf_core_copy_regs(elfregs, task_pt_regs(t));
 #endif
 	return 0;
 }
 
-extern int dump_fpu (struct pt_regs *, elf_fpregset_t *);
-
-static inline int elf_core_copy_task_fpregs(struct task_struct *t, struct pt_regs *regs, elf_fpregset_t *fpu)
-{
-#ifdef ELF_CORE_COPY_FPREGS
-	return ELF_CORE_COPY_FPREGS(t, fpu);
-#else
-	return dump_fpu(regs, fpu);
-#endif
-}
+int elf_core_copy_task_fpregs(struct task_struct *t, elf_fpregset_t *fpu);
 
 #ifdef CONFIG_ARCH_BINFMT_ELF_EXTRA_PHDRS
 /*

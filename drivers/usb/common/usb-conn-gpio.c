@@ -42,15 +42,6 @@ struct usb_conn_info {
 
 	struct power_supply_desc desc;
 	struct power_supply *charger;
-};
-
-/**
- * struct usb_conn_info_vendor - contains parameters without modifying the format of usb_conn_info
- * @info: contains usb_conn_info structure reference
- * initial_detection: bool to check if it's initial detection after probe
- */
-struct usb_conn_info_vendor {
-	struct usb_conn_info info;
 	bool initial_detection;
 };
 
@@ -74,14 +65,11 @@ struct usb_conn_info_vendor {
 static void usb_conn_detect_cable(struct work_struct *work)
 {
 	struct usb_conn_info *info;
-	struct usb_conn_info_vendor *v_info;
 	enum usb_role role;
 	int id, vbus, ret;
 
 	info = container_of(to_delayed_work(work),
 			    struct usb_conn_info, dw_det);
-
-	v_info = container_of(info, struct usb_conn_info_vendor, info);
 
 	/* check ID and VBUS */
 	id = info->id_gpiod ?
@@ -99,12 +87,12 @@ static void usb_conn_detect_cable(struct work_struct *work)
 	dev_dbg(info->dev, "role %s -> %s, gpios: id %d, vbus %d\n",
 		usb_role_string(info->last_role), usb_role_string(role), id, vbus);
 
-	if (!v_info->initial_detection && info->last_role == role) {
+	if (!info->initial_detection && info->last_role == role) {
 		dev_warn(info->dev, "repeated role: %s\n", usb_role_string(role));
 		return;
 	}
 
-	v_info->initial_detection = false;
+	info->initial_detection = false;
 
 	if (info->last_role == USB_ROLE_HOST && info->vbus)
 		regulator_disable(info->vbus);
@@ -190,15 +178,12 @@ static int usb_conn_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct usb_conn_info *info;
-	struct usb_conn_info_vendor *v_info;
-	bool need_vbus = true;
 	int ret = 0;
 
-	v_info = devm_kzalloc(dev, sizeof(*v_info), GFP_KERNEL);
-	if (!v_info)
+	info = devm_kzalloc(dev, sizeof(*info), GFP_KERNEL);
+	if (!info)
 		return -ENOMEM;
 
-	info = &v_info->info;
 	info->dev = dev;
 	info->id_gpiod = devm_gpiod_get_optional(dev, "id", GPIOD_IN);
 	if (IS_ERR(info->id_gpiod))
@@ -222,27 +207,12 @@ static int usb_conn_probe(struct platform_device *pdev)
 
 	INIT_DELAYED_WORK(&info->dw_det, usb_conn_detect_cable);
 
-	/*
-	 * If the USB connector is a child of a USB port and that port already provides the VBUS
-	 * supply, there's no need for the USB connector to provide it again.
-	 */
-	if (dev->parent && dev->parent->of_node) {
-		if (of_find_property(dev->parent->of_node, "vbus-supply", NULL))
-			need_vbus = false;
-	}
+	info->vbus = devm_regulator_get_optional(dev, "vbus");
+	if (PTR_ERR(info->vbus) == -ENODEV)
+		info->vbus = NULL;
 
-	if (!need_vbus) {
-		info->vbus = devm_regulator_get_optional(dev, "vbus");
-		if (PTR_ERR(info->vbus) == -ENODEV)
-			info->vbus = NULL;
-	} else {
-		info->vbus = devm_regulator_get(dev, "vbus");
-	}
-
-	if (IS_ERR(info->vbus)) {
-		ret = PTR_ERR(info->vbus);
-		return dev_err_probe(dev, ret, "failed to get vbus :%d\n", ret);
-	}
+	if (IS_ERR(info->vbus))
+		return dev_err_probe(dev, PTR_ERR(info->vbus), "failed to get vbus\n");
 
 	info->role_sw = usb_role_switch_get(dev);
 	if (IS_ERR(info->role_sw))
@@ -291,7 +261,7 @@ static int usb_conn_probe(struct platform_device *pdev)
 	device_set_wakeup_capable(&pdev->dev, true);
 
 	/* Perform initial detection */
-	v_info->initial_detection = true;
+	info->initial_detection = true;
 	usb_conn_queue_dwork(info, 0);
 
 	return 0;
@@ -301,7 +271,7 @@ put_role_sw:
 	return ret;
 }
 
-static int usb_conn_remove(struct platform_device *pdev)
+static void usb_conn_remove(struct platform_device *pdev)
 {
 	struct usb_conn_info *info = platform_get_drvdata(pdev);
 
@@ -311,8 +281,6 @@ static int usb_conn_remove(struct platform_device *pdev)
 		regulator_disable(info->vbus);
 
 	usb_role_switch_put(info->role_sw);
-
-	return 0;
 }
 
 static int __maybe_unused usb_conn_suspend(struct device *dev)
@@ -372,7 +340,7 @@ MODULE_DEVICE_TABLE(of, usb_conn_dt_match);
 
 static struct platform_driver usb_conn_driver = {
 	.probe		= usb_conn_probe,
-	.remove		= usb_conn_remove,
+	.remove_new	= usb_conn_remove,
 	.driver		= {
 		.name	= "usb-conn-gpio",
 		.pm	= &usb_conn_pm_ops,

@@ -1,1 +1,0 @@
-#define DRIVERVERSION	"v1.19.7-15-g4acdf59.20230408_beta_p2"

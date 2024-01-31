@@ -3,7 +3,7 @@
  * A policy database (policydb) specifies the
  * configuration data for the security policy.
  *
- * Author : Stephen Smalley, <sds@tycho.nsa.gov>
+ * Author : Stephen Smalley, <stephen.smalley.work@gmail.com>
  */
 
 /*
@@ -225,7 +225,7 @@ struct genfs {
 
 /* object context array indices */
 #define OCON_ISID	0 /* initial SIDs */
-#define OCON_FS		1 /* unlabeled file systems */
+#define OCON_FS		1 /* unlabeled file systems (deprecated) */
 #define OCON_PORT	2 /* TCP and UDP port numbers */
 #define OCON_NETIF	3 /* network interfaces */
 #define OCON_NODE	4 /* nodes */
@@ -238,8 +238,6 @@ struct genfs {
 /* The policy database */
 struct policydb {
 	int mls_enabled;
-	int android_netlink_route;
-	int android_netlink_getneigh;
 
 	/* symbol tables */
 	struct symtab symtab[SYM_NUM];
@@ -336,8 +334,6 @@ extern struct role_trans_datum *policydb_roletr_search(
 	struct policydb *p, struct role_trans_key *key);
 
 #define POLICYDB_CONFIG_MLS    1
-#define POLICYDB_CONFIG_ANDROID_NETLINK_ROUTE    (1 << 31)
-#define POLICYDB_CONFIG_ANDROID_NETLINK_GETNEIGH (1 << 30)
 
 /* the config flags related to unknown classes/perms are bits 2 and 3 */
 #define REJECT_UNKNOWN	0x00000002
@@ -370,9 +366,12 @@ static inline int next_entry(void *buf, struct policy_file *fp, size_t bytes)
 	return 0;
 }
 
-static inline int put_entry(const void *buf, size_t bytes, int num, struct policy_file *fp)
+static inline int put_entry(const void *buf, size_t bytes, size_t num, struct policy_file *fp)
 {
-	size_t len = bytes * num;
+	size_t len;
+
+	if (unlikely(check_mul_overflow(bytes, num, &len)))
+		return -EINVAL;
 
 	if (len > fp->len)
 		return -EINVAL;

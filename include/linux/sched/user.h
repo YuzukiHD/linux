@@ -7,7 +7,6 @@
 #include <linux/percpu_counter.h>
 #include <linux/refcount.h>
 #include <linux/ratelimit.h>
-#include <linux/android_kabi.h>
 
 /*
  * Some day this will be a full-fledged user tracking system..
@@ -25,7 +24,8 @@ struct user_struct {
 	kuid_t uid;
 
 #if defined(CONFIG_PERF_EVENTS) || defined(CONFIG_BPF_SYSCALL) || \
-    defined(CONFIG_NET) || defined(CONFIG_IO_URING)
+	defined(CONFIG_NET) || defined(CONFIG_IO_URING) || \
+	defined(CONFIG_VFIO_PCI_ZDEV_KVM) || IS_ENABLED(CONFIG_IOMMUFD)
 	atomic_long_t locked_vm;
 #endif
 #ifdef CONFIG_WATCH_QUEUE
@@ -34,23 +34,15 @@ struct user_struct {
 
 	/* Miscellaneous per-user rate limit */
 	struct ratelimit_state ratelimit;
-
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
-};
-
-struct ext_user_struct {
-	struct user_struct user;
-	ANDROID_OEM_DATA_ARRAY(1, 2);
 };
 
 extern int uids_sysfs_init(void);
 
 extern struct user_struct *find_user(kuid_t);
 
-extern struct ext_user_struct ext_root_user;
-extern struct user_struct *root_user;
-#define INIT_USER (&ext_root_user.user)
+extern struct user_struct root_user;
+#define INIT_USER (&root_user)
+
 
 /* per-UID process charging. */
 extern struct user_struct * alloc_uid(kuid_t);

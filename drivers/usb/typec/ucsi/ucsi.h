@@ -15,6 +15,7 @@
 
 struct ucsi;
 struct ucsi_altmode;
+struct dentry;
 
 /* UCSI offsets (Bytes) */
 #define UCSI_VERSION			0
@@ -277,6 +278,16 @@ struct ucsi_connector_status {
 
 /* -------------------------------------------------------------------------- */
 
+struct ucsi_debugfs_entry {
+	u64 command;
+	struct ucsi_data {
+		u64 low;
+		u64 high;
+	} response;
+	u32 status;
+	struct dentry *dentry;
+};
+
 struct ucsi {
 	u16 version;
 	struct device *dev;
@@ -286,8 +297,11 @@ struct ucsi {
 
 	struct ucsi_capability cap;
 	struct ucsi_connector *connector;
+	struct ucsi_debugfs_entry *debugfs;
 
-	struct work_struct work;
+	struct work_struct resume_work;
+	struct delayed_work work;
+	int work_count;
 #define UCSI_ROLE_SWITCH_RETRY_PER_HZ	10
 #define UCSI_ROLE_SWITCH_INTERVAL	(HZ / UCSI_ROLE_SWITCH_RETRY_PER_HZ)
 #define UCSI_ROLE_SWITCH_WAIT_COUNT	(10 * UCSI_ROLE_SWITCH_RETRY_PER_HZ)
@@ -303,26 +317,6 @@ struct ucsi {
 #define EVENT_PENDING	0
 #define COMMAND_PENDING	1
 #define ACK_PENDING	2
-#define EVENT_PROCESSING	3
-};
-
-/**
- * struct ucsi_android - contains parameters without modifying the format
- * of ucsi struct.
- * @ucsi: contains the ucsi reference.
- * @work: work structure for queuing ucsi_init_work.
- * @work_count: to track the wait count(MAX= UCSI_ROLE_SWITCH_WAIT_COUNT).
- *
- * Required to address Bug: 260537721
- * If the role switch module probes late the
- * fwnode_usb_role_switch_get() will fail with -EPROBE_DEFER.
- * To recover from this, restart the ucsi_init_work
- * to find the fwnode again using a delayed workqueue.
- */
-struct ucsi_android {
-	struct ucsi ucsi;
-	struct delayed_work work;
-	int work_count;
 };
 
 #define UCSI_MAX_SVID		5
@@ -339,6 +333,8 @@ struct ucsi_connector {
 	struct mutex lock; /* port lock */
 	struct work_struct work;
 	struct completion complete;
+	struct workqueue_struct *wq;
+	struct list_head partner_tasks;
 
 	struct typec_port *port;
 	struct typec_partner *partner;
@@ -348,7 +344,6 @@ struct ucsi_connector {
 
 	struct typec_capability typec_cap;
 
-	u16 unprocessed_changes;
 	struct ucsi_connector_status status;
 	struct ucsi_connector_capability cap;
 	struct power_supply *psy;
@@ -356,6 +351,14 @@ struct ucsi_connector {
 	u32 rdo;
 	u32 src_pdos[PDO_MAX_OBJECTS];
 	int num_pdos;
+
+	/* USB PD objects */
+	struct usb_power_delivery *pd;
+	struct usb_power_delivery_capabilities *port_source_caps;
+	struct usb_power_delivery_capabilities *port_sink_caps;
+	struct usb_power_delivery *partner_pd;
+	struct usb_power_delivery_capabilities *partner_source_caps;
+	struct usb_power_delivery_capabilities *partner_sink_caps;
 
 	struct usb_role_switch *usb_role_sw;
 };
@@ -396,6 +399,18 @@ ucsi_register_displayport(struct ucsi_connector *con,
 static inline void
 ucsi_displayport_remove_partner(struct typec_altmode *adev) { }
 #endif /* CONFIG_TYPEC_DP_ALTMODE */
+
+#ifdef CONFIG_DEBUG_FS
+void ucsi_debugfs_init(void);
+void ucsi_debugfs_exit(void);
+void ucsi_debugfs_register(struct ucsi *ucsi);
+void ucsi_debugfs_unregister(struct ucsi *ucsi);
+#else
+static inline void ucsi_debugfs_init(void) { }
+static inline void ucsi_debugfs_exit(void) { }
+static inline void ucsi_debugfs_register(struct ucsi *ucsi) { }
+static inline void ucsi_debugfs_unregister(struct ucsi *ucsi) { }
+#endif /* CONFIG_DEBUG_FS */
 
 /*
  * NVIDIA VirtualLink (svid 0x955) has two altmode. VirtualLink
